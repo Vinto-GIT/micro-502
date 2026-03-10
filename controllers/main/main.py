@@ -15,7 +15,7 @@ import time, random
 import threading
 
 exp_num = 1                    # 0: Coordinate Transformation, 1: PID Tuning, 2: Kalman Filter, 3: Motion Planning, 4: Project
-control_style = 'keyboard'      # 'keyboard' or 'path_planner'
+control_style = 'path_planner'      # 'keyboard' or 'path_planner'
 rand_env = False                # Randomise the environment
 
 # Global variables for handling threads
@@ -47,7 +47,6 @@ class CrazyflieInDroneDome(Supervisor):
         self.m4_motor = self.getDevice("m4_motor")
         self.m4_motor.setPosition(float('inf'))
         self.m4_motor.setVelocity(1)
-
         self.meas_state_gps = np.zeros((3,1))
         self.meas_state_accel = np.zeros((3,1))
 
