@@ -63,7 +63,7 @@ class CrazyflieInDroneDome(Supervisor):
             self.ctrl_update_period = int(self.timestep*3) #timestep equal to GPS time 2 or 3 works well
             self.gps_update_period = int(self.timestep*3) # 2*timestep
             self.accel_update_period = int(self.timestep*2) # 1*timestep
-        else:
+        else:   
             self.ctrl_update_period = self.timestep
             self.gps_update_period = self.timestep
             self.accel_update_period = self.timestep
@@ -750,6 +750,3 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         running = False
         planner_thread.join()
-
-
-
