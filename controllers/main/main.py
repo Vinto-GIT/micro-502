@@ -14,16 +14,8 @@ import lib.mapping_and_planning_examples as mapping_and_planning_examples
 import time, random
 import threading
 
-<<<<<<< HEAD
-<<<<<<< HEAD
-exp_num = 1                    # 0: Coordinate Transformation, 1: PID Tuning, 2: Kalman Filter, 3: Motion Planning, 4: Project
-=======
-exp_num = 2                    # 0: Coordinate Transformation, 1: PID Tuning, 2: Kalman Filter, 3: Motion Planning, 4: Project
->>>>>>> 3382899d754bb6a8b3d18861e42a128a221f576e
-=======
 exp_num = 4                    # 0: Coordinate Transformation, 1: PID Tuning, 2: Kalman Filter, 3: Motion Planning, 4: Project
->>>>>>> 1c584a696835a866e72d0283c480903759351c78
-control_style = 'path_planner'      # 'keyboard' or 'path_planner'
+control_style = 'keyboard'      # 'keyboard' or 'path_planner'
 rand_env = True                # Randomise the environment
 
 # Global variables for handling threads
