@@ -10,7 +10,6 @@ class quadrotor_controller():
         self.tuning_level = "vel_z" #"off" to disable tuning
         
         # Only change the gains you are asked to, the others are already tuned by us (INITIAL GAINS)
-<<<<<<< HEAD
         gains = {
                     "P_pos_z": 8.0,     "I_pos_z": 0.0,     "D_pos_z": 0.8,
                     "P_pos_xy": 0.5,    "I_pos_xy": 0.0,    "D_pos_xy": 0.0,
@@ -30,18 +29,6 @@ class quadrotor_controller():
                         "L_vel_xy": 2.0
                         }
         ### END EXERCISE 1 tuning part ###
-=======
-        # gains = {
-        #             "P_pos_z": 8.0,     "I_pos_z": 0.0,     "D_pos_z": 0.8,
-        #             "P_pos_xy": 0.5,    "I_pos_xy": 0.0,    "D_pos_xy": 0.0,
-        #             "P_vel_z": 2.0,     "I_vel_z": 0.0,     "D_vel_z": 1.0,
-        #             "P_vel_xy": 0.2,    "I_vel_xy": 0.0,    "D_vel_xy": 0.0,
-        #             "P_att_rp": 10.0,   "I_att_rp": 0.0,    "D_att_rp": 0.2,
-        #             "P_att_y": 4.0,     "I_att_y": 0.0,     "D_att_y": 0.3,
-        #             "P_rate_rp": 1.5,   "I_rate_rp":0.0,    "D_rate_rp": 0.1,
-        #             "P_rate_y": 0.02,   "I_rate_y": 0.0,    "D_rate_y": 0.001
-        #             }
->>>>>>> 3382899d754bb6a8b3d18861e42a128a221f576e
         
         if exp_num == 2 or exp_num == 3:
             # KF gains and limits
