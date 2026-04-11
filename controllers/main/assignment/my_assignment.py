@@ -42,12 +42,12 @@ CAM_WIDTH  = 324
 CAM_HEIGHT = 244
 CAM_FOV_H  = np.radians(90)   # Field of view horizontal — à ajuster selon ta caméra Webots
 
-# --- Filtre couleur magenta en HSV ---
-# Ajuste ces valeurs si la détection est mauvaise (voir section CALIBRATION plus bas)
-HSV_LOWER_MAG1 = np.array([140,  80,  80])   # Violet-magenta
+# --- Filtre couleur magenta/rose en HSV ---
+# Gates roses/magenta clairs dans Webots : teinte ~150-175, saturation potentiellement faible
+HSV_LOWER_MAG1 = np.array([140,  30,  80])   # Violet-magenta, S abaissé pour le rose clair
 HSV_UPPER_MAG1 = np.array([180, 255, 255])
-HSV_LOWER_MAG2 = np.array([  0,  80,  80])   # Rouge-magenta (wrapping hue)
-HSV_UPPER_MAG2 = np.array([ 10, 255, 255])
+HSV_LOWER_MAG2 = np.array([  0,  30,  80])   # Rouge-magenta (wrapping hue)
+HSV_UPPER_MAG2 = np.array([ 15, 255, 255])
 
 # --- Seuil de détection ---
 MIN_CONTOUR_AREA = 200   # Pixels². Augmente si trop de faux positifs, baisse si tu rates des gates lointains
@@ -122,7 +122,7 @@ def detect_gates(image):
         if area < MIN_CONTOUR_AREA:
             continue
 
-        # Bounding box de l'aire ==> x et y ; position  du coin haut-gauche, w et h : dimensions de la boîte englobante
+        # Bounding box
         x, y, w, h = cv2.boundingRect(contour)
 
         # Centroïde précis via les moments d'image
@@ -215,9 +215,9 @@ class MyAssignment:
             print(f"[VISION] Gate : centroïde=({best['cx']:.1f}px, {best['cy']:.1f}px)  "
                   f"angle_h={np.degrees(best['angle_h']):.1f}°  aire={best['area']:.0f}px²")
 
-        # --- Décollage minimal pour tester la détection ---
-        if sensor_data['z_global'] < 0.49:
-            return [pos[0], pos[1], 1.0, yaw]
+        # --- Décollage à 1.5m ---
+        if sensor_data['z_global'] < 1.4:
+            return [pos[0], pos[1], 1.5, yaw]
 
         # Reste sur place — navigation à coder ensuite
         return [pos[0], pos[1], 1.0, yaw]
