@@ -42,7 +42,8 @@ MIN_CONTOUR_AREA = 300
 NUM_GATES = 5
 OVERFLY_ALT = 2.0          # altitude pour passer au-dessus du gate
 CRUISE_ALT  = 1.5          # altitude de croisière normale
-TAKEOFF_POS = np.array([1.4, 0.1])   # position fixe du pad de décollage
+TAKEOFF_POS    = np.array([1.0, 4.0])   # position 2D fixe du pad de décollage [x=1, y=4]
+CIRCUIT_CENTER = np.array([4.0, 4.0])  # centre fixe de l'arène (circle_centre dans main.py)
 
 
 # =============================================================================
@@ -227,8 +228,12 @@ class MyAssignment:
         self.current_gate_idx = 0
 
         # Variables pour les laps rapides (lap 2 et 3)
-        self.lap2_gate_idx  = 0   # indice du gate courant dans l'ordre CCW
-        self.lap2_lap_count = 0   # nombre de laps rapides effectués (max 2)
+        self.lap2_gate_idx  = 0    # indice du gate courant dans l'ordre CCW
+        self.lap2_lap_count = 0    # nombre de laps rapides effectués (max 2)
+        self.lap2_started   = False  # False tant qu'on n'est pas revenu au décollage
+
+        # Position réelle au sol enregistrée au premier step (plus fiable que TAKEOFF_POS)
+        self.takeoff_pos_recorded = None
 
     def _reset_for_next_gate(self):
         """Réinitialise les variables de tracking pour chercher le gate suivant."""
@@ -241,33 +246,42 @@ class MyAssignment:
 
     def _reorder_gates_ccw(self, gate_positions):
         """
-        Réordonne les gates dans le sens anti-horaire (CCW) en partant
-        du premier gate rencontré en tournant CCW depuis TAKEOFF_POS.
+        Réordonne les gates dans l'ordre de la course (CCW = drone_angle croissant).
 
-        Principe :
-          1. Centre de l'arène = barycentre des gates détectés
-          2. Angle de chaque gate depuis ce centre
-          3. Angle relatif à la direction décollage→centre (= angle 0)
-          4. Tri croissant de cet angle relatif → ordre CCW depuis le décollage
+        Utilise exactement la même convention angulaire que check_segment dans main.py :
+          drone_angle = arctan2(gy - cy, gx - cx) + π  ∈ [0, 2π]
+        avec cx, cy = CIRCUIT_CENTER = [4, 4].
+
+        Le segment 0 (décollage) couvre drone_angle ∈ [330°, 15°].
+        Le gate 1 (segment 1) commence à ~45°.
+        On trie par drone_angle croissant puis on fait pivoter la liste
+        pour que le premier gate soit celui juste après la zone de décollage.
         """
-        if len(gate_positions) < 2:
-            return gate_positions
+        def drone_angle(gp):
+            rel = np.array(gp[:2]) - CIRCUIT_CENTER
+            norm = np.linalg.norm(rel)
+            if norm < 1e-6:
+                return 0.0
+            return (np.arctan2(rel[1] / norm, rel[0] / norm) + np.pi) % (2 * np.pi)
 
-        center = np.mean([g[:2] for g in gate_positions], axis=0)
+        sorted_gates = sorted(gate_positions, key=drone_angle)
 
-        # Angle du pad de décollage vu depuis le centre
-        takeoff_angle = np.arctan2(TAKEOFF_POS[1] - center[1],
-                                   TAKEOFF_POS[0] - center[0])
+        # Borne supérieure du segment 0 : π/12 rad ≈ 15°
+        # Le premier gate de la course a drone_angle > π/12
+        TAKEOFF_ZONE_END = np.pi / 12
 
-        # Pour chaque gate : angle relatif au décollage, modulo 2π (→ CCW)
-        def ccw_key(gp):
-            a = np.arctan2(gp[1] - center[1], gp[0] - center[0])
-            return (a - takeoff_angle) % (2 * np.pi)
+        start_idx = 0
+        for i, gp in enumerate(sorted_gates):
+            if drone_angle(gp) > TAKEOFF_ZONE_END:
+                start_idx = i
+                break
 
-        ordered = sorted(gate_positions, key=ccw_key)
-        print(f"[CCW] Centre arène estimé : {center}")
+        # Rotation de la liste pour partir du bon gate
+        ordered = sorted_gates[start_idx:] + sorted_gates[:start_idx]
+
+        print(f"[CCW] Centre arène : {CIRCUIT_CENTER}")
         for i, gp in enumerate(ordered):
-            print(f"[CCW] Gate {i+1} → {gp}")
+            print(f"[CCW] Gate {i+1} → {gp} (drone_angle={np.degrees(drone_angle(gp)):.1f}°)")
         return ordered
 
     def _closest_detection_to_target(self, detections, pos, yaw):
@@ -311,6 +325,10 @@ class MyAssignment:
         # TAKEOFF
         # =====================================================================
         if self.state == 'takeoff':
+            # Enregistrer la position réelle du pad dès le premier step
+            if self.takeoff_pos_recorded is None:
+                self.takeoff_pos_recorded = pos[:2].copy()
+                print(f"[TAKEOFF] Position décollage enregistrée : {self.takeoff_pos_recorded}")
             if sensor_data['z_global'] < 1.4:
                 return [pos[0], pos[1], CRUISE_ALT, yaw]
             else:
@@ -501,7 +519,8 @@ class MyAssignment:
                     self.gate_positions = self._reorder_gates_ccw(self.gate_positions)
                     self.lap2_gate_idx  = 0
                     self.lap2_lap_count = 0
-                    print(f"[STATE] {NUM_GATES} gates trouvés et réordonnés → lap2")
+                    self.lap2_started   = False  # devra d'abord revenir au décollage
+                    print(f"[STATE] {NUM_GATES} gates trouvés et réordonnés → lap2 (retour décollage)")
                     self.state = 'lap2'
                 else:
                     print(f"[STATE] Gate traversé → scan_clear")
@@ -538,12 +557,31 @@ class MyAssignment:
 
         # =====================================================================
         # LAP2 : voler à travers les gates connus dans l'ordre CCW, 2 fois
-        #   - Setpoint direct sur chaque gate (pas de step limité) → vitesse max
-        #   - Passage validé quand le drone est à moins de 0.5 m du centre du gate
+        #   - Phase 0 : retourner au pad de décollage avant de démarrer
+        #   - Cible = centroïde du gate courant (pas de waypoints approach/exit)
+        #   - "Carotte" step-limitée : on avance le setpoint de quelques cm/tick
+        #     dans la direction du gate au lieu de lui envoyer la position finale,
+        #     pour que le PID reste stable au lieu de pousser à fond
+        #   - Anticipation du yaw vers le gate suivant dès 1.5 m
         # =====================================================================
         if self.state == 'lap2':
 
-            # Fin d'un tour : passer au suivant ou terminer
+            # -- Phase 0 : retourner au pad de décollage avant de démarrer --
+            if not self.lap2_started:
+                home = self.takeoff_pos_recorded if self.takeoff_pos_recorded is not None \
+                       else TAKEOFF_POS
+                dx_h = home[0] - pos[0]
+                dy_h = home[1] - pos[1]
+                dist_home = np.linalg.norm([dx_h, dy_h])
+                if dist_home < 0.4:
+                    self.lap2_started  = True
+                    self.lap2_gate_idx = 0
+                    print("[LAP2] Pad de décollage atteint → début des laps rapides")
+                else:
+                    target_yaw = np.arctan2(dy_h, dx_h)
+                    return [float(home[0]), float(home[1]), CRUISE_ALT, target_yaw]
+
+            # -- Fin d'un tour : passer au suivant ou terminer --
             if self.lap2_gate_idx >= NUM_GATES:
                 self.lap2_lap_count += 1
                 self.lap2_gate_idx   = 0
@@ -554,21 +592,53 @@ class MyAssignment:
                 print(f"[LAP2] Tour {self.lap2_lap_count + 1}/2 — retour gate 1")
 
             target = self.gate_positions[self.lap2_gate_idx]
-            dx = target[0] - pos[0]
-            dy = target[1] - pos[1]
+            dx     = target[0] - pos[0]
+            dy     = target[1] - pos[1]
+            dz     = target[2] - pos[2]
             dist_h = np.linalg.norm([dx, dy])
 
             # Gate considéré comme traversé quand on est assez proche
-            GATE_PASS_DIST = 0.5
+            GATE_PASS_DIST = 0.1
             if dist_h < GATE_PASS_DIST:
                 print(f"[LAP2] Gate {self.lap2_gate_idx + 1}/{NUM_GATES} traversé "
                       f"(tour {self.lap2_lap_count + 1}/2)")
                 self.lap2_gate_idx += 1
                 return [pos[0], pos[1], float(target[2]), yaw]
 
-            # Setpoint direct sur le gate (le PID gère la vitesse d'approche)
-            target_yaw = np.arctan2(dy, dx)
-            return [float(target[0]), float(target[1]), float(target[2]), target_yaw]
+            # Anticipation du yaw : orienter vers le gate suivant dès 1.5 m
+            # pour ne pas s'arrêter et pivoter sur place entre deux gates
+            ANTICIPATE_DIST = 1.5
+            next_idx    = (self.lap2_gate_idx + 1) % NUM_GATES
+            next_target = self.gate_positions[next_idx]
+
+            if dist_h < ANTICIPATE_DIST:
+                alpha_yaw   = 1.0 - (dist_h / ANTICIPATE_DIST)
+                yaw_current = np.arctan2(dy, dx)
+                dx_next     = next_target[0] - pos[0]
+                dy_next     = next_target[1] - pos[1]
+                yaw_next    = np.arctan2(dy_next, dx_next)
+                target_yaw  = self._normalize_angle(
+                    yaw_current + alpha_yaw * self._angle_diff(yaw_next, yaw_current)
+                )
+            else:
+                target_yaw = np.arctan2(dy, dx)
+
+            # Carotte step-limitée : le PID suit une cible proche et stable
+            # au lieu d'une cible lointaine à plein régime
+            LAP2_SPEED_XY = 0.5    # m par tick horizontal
+            LAP2_SPEED_Z  = 0.2    # m par tick vertical
+
+            step_xy = min(LAP2_SPEED_XY, dist_h)
+            move_x  = pos[0] + step_xy * (dx / dist_h)
+            move_y  = pos[1] + step_xy * (dy / dist_h)
+
+            # Cible Z limitée aussi pour éviter les sauts verticaux brutaux
+            if abs(dz) < 0.01:
+                move_z = float(target[2])
+            else:
+                move_z = pos[2] + np.sign(dz) * min(abs(dz), LAP2_SPEED_Z)
+
+            return [float(move_x), float(move_y), float(move_z), target_yaw]
 
         # =====================================================================
         # FINISHED
