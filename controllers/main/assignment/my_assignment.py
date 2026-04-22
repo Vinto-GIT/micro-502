@@ -37,7 +37,7 @@ HSV_UPPER_MAG1 = np.array([180, 255, 255])
 HSV_LOWER_MAG2 = np.array([  0,  80,  80])
 HSV_UPPER_MAG2 = np.array([ 15, 255, 255])
 
-MIN_CONTOUR_AREA = 300
+MIN_CONTOUR_AREA = 200
 
 NUM_GATES = 5
 OVERFLY_ALT = 2.0          # altitude pour passer au-dessus du gate
@@ -115,18 +115,26 @@ def detect_gates(image):
         angle_h = (cx - CAM_WIDTH / 2.0) * angle_per_pixel
         angle_v = (CAM_HEIGHT / 2.0 - cy) * (CAM_FOV_V / CAM_HEIGHT)
 
-        MIN_BBOX_SIZE = 10
+        MIN_BBOX_SIZE = 15
         if w < MIN_BBOX_SIZE or h < MIN_BBOX_SIZE:
             continue
 
-        # Filtre noir à droite
+        # Rejeter les contours très allongés (probablement du bruit ou des barres isolées
+        # d'un gate, pas le gate entier). Un gate vu même de biais garde un ratio raisonnable.
+        aspect_ratio = w / max(h, 1)
+        if aspect_ratio > 4.0 or aspect_ratio < 0.25:
+            continue
+
+        # Filtre noir à droite : s'assure que le gate détecté est isolé à sa droite
+        # (pas un morceau de gate collé à un autre). Seuil assoupli à 40% pour tolérer
+        # les scènes avec plusieurs gates proches les uns des autres.
         BLACK_MARGIN = 10
         right_edge = min(x + w + BLACK_MARGIN, mask.shape[1] - 1)
         has_black_right = False
         if right_edge > x + w:
             right_strip = mask[y:y+h, x+w:right_edge]
             white_ratio = np.sum(right_strip > 0) / right_strip.size
-            has_black_right = (white_ratio <= 0.2)
+            has_black_right = (white_ratio <= 0.4)
 
         if not has_black_right:
             continue
@@ -218,6 +226,10 @@ class MyAssignment:
         self.best_angle_h = None
         self.refine_shrink_count = 0
 
+        # Timeout scan_ccw : si on tourne depuis longtemps sans voir 4 coins,
+        # on accepte le plus gros contour comme fallback
+        self.scan_frames = 0
+
         # Position estimée du gate courant (lissée)
         self.gate_rough_pos  = None
         self.lost_count      = 0
@@ -248,6 +260,7 @@ class MyAssignment:
         self.best_area = 0.0
         self.best_angle_h = None
         self.refine_shrink_count = 0
+        self.scan_frames = 0
 
     def _reorder_gates_ccw(self, gate_positions):
         """
@@ -316,24 +329,7 @@ class MyAssignment:
 
         Ordre 7 = 8 coefficients, 8 contraintes (4 au début + 4 à la fin)
         → système linéaire carré résolu exactement.
-
-        Paramètres :
-          p0, v0, a0, j0 : position, vitesse, accélération, jerk de départ
-          p1, v1, a1, j1 : position, vitesse, accélération, jerk d'arrivée
-          T              : durée du segment
-
-        Retourne : np.array([c0, c1, c2, c3, c4, c5, c6, c7]) de taille (8, d)
-                   où d = dimension de p (3 pour x/y/z traités en bloc)
         """
-        # Matrice des contraintes : chaque ligne = une équation
-        #   p(0) = c0                      → [1, 0, 0, 0, 0, 0, 0, 0]
-        #   v(0) = c1                      → [0, 1, 0, 0, 0, 0, 0, 0]
-        #   a(0) = 2 c2                   → [0, 0, 2, 0, 0, 0, 0, 0]
-        #   j(0) = 6 c3                   → [0, 0, 0, 6, 0, 0, 0, 0]
-        #   p(T) = Σ ck T^k               → [1, T, T², T³, T⁴, T⁵, T⁶, T⁷]
-        #   v(T) = Σ k ck T^(k-1)
-        #   a(T) = Σ k(k-1) ck T^(k-2)
-        #   j(T) = Σ k(k-1)(k-2) ck T^(k-3)
         A = np.array([
             [1, 0, 0,  0,     0,      0,       0,         0],
             [0, 1, 0,  0,     0,      0,       0,         0],
@@ -346,15 +342,12 @@ class MyAssignment:
         ], dtype=np.float64)
 
         b = np.array([p0, v0, a0, j0, p1, v1, a1, j1], dtype=np.float64)
-        # np.linalg.solve gère les tableaux multi-colonnes : résout pour x, y, z simultanément
         return np.linalg.solve(A, b)
 
     def _eval_poly(self, coeffs, t):
-        """Évalue un polynôme et ses dérivées à t. Retourne (pos, vel, acc)."""
-        # coeffs shape : (8, d)  avec d = 3 pour position 3D
+        """Évalue un polynôme et ses dérivées à t. Retourne (pos, vel)."""
         t_pow  = np.array([t**k for k in range(8)])
         dt_pow = np.array([k * t**(k-1) if k >= 1 else 0 for k in range(8)])
-        # pos = Σ ck t^k ; on fait un produit scalaire ligne par ligne
         pos = np.einsum('k,kd->d', t_pow,  coeffs)
         vel = np.einsum('k,kd->d', dt_pow, coeffs)
         return pos, vel
@@ -362,31 +355,21 @@ class MyAssignment:
     def _compute_trajectory(self, start_pos, waypoints, end_pos,
                             avg_speed=1.5, gate_speed_factor=0.6):
         """
-        Calcule une trajectoire min-snap par morceaux entre start_pos, tous les
-        waypoints (passages de gates), et end_pos.
+        Calcule une trajectoire min-snap par morceaux.
 
-        La trajectoire est composée de N segments polynomiaux d'ordre 7, avec :
-          - Position, vitesse, accélération, jerk continus à chaque joint
-          - Vitesse et accélération nulles aux extrémités (start et end)
-          - Vitesse aux gates imposée dans la direction de la normale, mais RÉDUITE
-            (gate_speed_factor < 1) pour forcer le drone à passer précisément par
-            le centroïde. Moins de vitesse = moins d'inertie = moins d'écart
-            lors du passage.
-          - Durée de chaque segment ∝ longueur / avg_speed
+        - Entre deux gates : durée = distance / avg_speed (vitesse cruise PLEINE).
+          Le drone peut donc réellement accélérer sur les portions rectilignes.
+        - Au centroïde des gates : vitesse réduite à gate_speed = avg_speed * gate_speed_factor
+          pour garantir un passage précis au centre sans trop d'inertie latérale.
+        - Aux extrémités (start/end) : vitesse nulle.
 
         Paramètres :
-          start_pos          : np.array(3), position de départ
-          waypoints          : liste de dicts {'pos': np.array(3), 'normal': np.array(2)}
-          end_pos            : np.array(3), position finale
-          avg_speed          : vitesse moyenne ciblée entre waypoints (m/s)
-          gate_speed_factor  : facteur ]0,1] appliqué à la vitesse AU centroïde
-                               des gates. 0.6 = traversée 40% plus lente pour
-                               garantir le passage au centre.
+          avg_speed          : vitesse CRUISE entre gates (m/s) → monter pour + rapide
+          gate_speed_factor  : facteur ]0,1] appliqué à la vitesse AU centroïde des gates
+                               (plus bas = passage plus précis mais décélération marquée)
 
         Retourne :
-          dict {'polys':     liste des matrices de coefficients (8, 3) par segment,
-                'durations': liste des durées par segment,
-                'total_time': durée totale}
+          dict {'polys': liste des (8,3) coeffs, 'durations': [...], 'total_time': T}
         """
         # Construction de la liste complète de points [start, wp1, wp2, ..., end]
         all_points = [{'pos': start_pos, 'normal': None}]
@@ -396,9 +379,11 @@ class MyAssignment:
 
         gate_speed = avg_speed * gate_speed_factor
 
-        # --- Durées des segments : ∝ distance / vitesse effective du segment ---
-        # On utilise la vitesse "à l'entrée" + "à la sortie" moyennée pour ne pas
-        # faire de saccades. Segments qui touchent un gate → vitesse réduite.
+        # --- Durées des segments : ∝ distance / avg_speed (cruise plein) ---
+        # Entre deux gates, le drone doit parcourir la distance à la vitesse cruise.
+        # La vitesse imposée AU gate est réduite (gate_speed), mais la vitesse
+        # MOYENNE dans le segment est proche de avg_speed car le drone accélère
+        # entre les deux extrémités.
         durations = []
         for i in range(N):
             d = np.linalg.norm(all_points[i+1]['pos'] - all_points[i]['pos'])
@@ -444,25 +429,21 @@ class MyAssignment:
 
         total_time = sum(durations)
         print(f"[TRAJ] {N} segments, durée totale = {total_time:.2f}s, "
-              f"vitesse cruise = {avg_speed:.1f}m/s, gate = {gate_speed:.1f}m/s")
+              f"cruise = {avg_speed:.1f}m/s, gate = {gate_speed:.1f}m/s")
 
         return {'polys': polys, 'durations': durations, 'total_time': total_time}
 
     def _sample_trajectory(self, traj, t):
         """
         Évalue la trajectoire à l'instant global t.
-        Retourne la position (np.array(3)) et la vitesse (np.array(3)).
-
-        Si t dépasse total_time, retourne la position finale avec vitesse nulle.
+        Retourne (position np.array(3), vitesse np.array(3)).
         """
         if t >= traj['total_time']:
-            # Fin de trajectoire : évaluer le dernier segment à sa durée max
             last_poly = traj['polys'][-1]
             last_dur  = traj['durations'][-1]
             pos, _ = self._eval_poly(last_poly, last_dur)
             return pos, np.zeros(3)
 
-        # Trouver le segment courant et le temps local
         t_local = t
         for i, dur in enumerate(traj['durations']):
             if t_local <= dur:
@@ -470,7 +451,6 @@ class MyAssignment:
                 return pos, vel
             t_local -= dur
 
-        # Sécurité (ne devrait pas arriver)
         last_poly = traj['polys'][-1]
         last_dur  = traj['durations'][-1]
         pos, _ = self._eval_poly(last_poly, last_dur)
@@ -495,8 +475,6 @@ class MyAssignment:
         n = len(ordered_gates)
         base_waypoints = []
         for i, g in enumerate(ordered_gates):
-            # Pour la normale : point précédent = gate i-1 (ou start pour i=0)
-            #                   point suivant  = gate i+1 (ou gate 0 pour i=n-1, boucle)
             prev_pos = ordered_gates[i - 1] if i > 0 else start_pos
             next_pos = ordered_gates[(i + 1) % n]
             normal   = self._estimate_gate_normal(g, prev_pos, next_pos)
@@ -505,18 +483,11 @@ class MyAssignment:
                 'pos':    np.array(g, dtype=np.float64).copy(),
                 'normal': normal,
             })
-        # Répéter pour 2 laps
         return base_waypoints + base_waypoints
 
     def _plot_trajectory(self, traj, ordered_gates, waypoints, start_pos, end_pos,
                          filename='trajectory.png'):
-        """
-        Génère un plot 3D de la trajectoire complète avec les gates.
-        Sauvegardé en PNG à la racine du projet Webots.
-
-        ordered_gates : liste des np.array([x, y, z]) (centroïdes uniquement)
-        waypoints     : liste de dicts {'pos', 'normal'} (contient normales estimées)
-        """
+        """Plot 3D de la trajectoire min-snap avec les gates."""
         try:
             import matplotlib.pyplot as plt
             from mpl_toolkits.mplot3d import Axes3D  # noqa
@@ -524,23 +495,16 @@ class MyAssignment:
             print("[PLOT] matplotlib non disponible — plot ignoré")
             return
 
-        # Échantillonner la trajectoire à haute résolution pour le tracé
         t_samples = np.linspace(0, traj['total_time'], 500)
         path = np.array([self._sample_trajectory(traj, t)[0] for t in t_samples])
 
         fig = plt.figure(figsize=(10, 8))
         ax  = fig.add_subplot(111, projection='3d')
 
-        # Trajectoire
         ax.plot(path[:, 0], path[:, 1], path[:, 2], 'k-', lw=2, label='Trajectoire min-snap')
 
-        # Gates : rectangle dans le plan perpendiculaire à la normale
-        # On n'a pas accès aux coins 3D, donc on dessine un rectangle symbolique
-        # de taille GATE_REAL_WIDTH × GATE_REAL_HEIGHT centré sur le centroïde
         for i, g in enumerate(ordered_gates):
-            # Normale du gate (depuis les waypoints du premier lap)
             n = waypoints[i]['normal'] if i < len(waypoints) else np.array([1.0, 0.0])
-            # Vecteur tangent dans le plan XY (perpendiculaire à n)
             tangent = np.array([-n[1], n[0], 0.0])
             up      = np.array([0.0, 0.0, 1.0])
             half_w  = GATE_REAL_WIDTH  / 2.0
@@ -550,13 +514,12 @@ class MyAssignment:
                 g - tangent * half_w + up * half_h,
                 g - tangent * half_w - up * half_h,
                 g + tangent * half_w - up * half_h,
-                g + tangent * half_w + up * half_h,  # fermer
+                g + tangent * half_w + up * half_h,
             ])
             ax.plot(corners[:, 0], corners[:, 1], corners[:, 2], 'r-', lw=2)
             ax.scatter(*g, c='cyan', s=80, edgecolors='k', zorder=5)
             ax.text(g[0], g[1], g[2] + 0.15, f'G{i+1}', fontsize=10, ha='center')
 
-        # Start / end
         ax.scatter(*start_pos, c='green', s=120, marker='o', label='Start', edgecolors='k', zorder=5)
         ax.scatter(*end_pos,   c='red',   s=120, marker='X', label='End',   edgecolors='k', zorder=5)
 
@@ -636,18 +599,37 @@ class MyAssignment:
 
         # =====================================================================
         # SCAN_CCW : tourner CCW jusqu'à 4 coins + noir droite
+        #   Fallback : si on tourne depuis très longtemps sans trouver 4 coins,
+        #   accepter le plus gros contour (partiellement visible) pour ne pas rester bloqué
         # =====================================================================
         if self.state == 'scan_ccw':
             detections, self.debug_mask, _ = detect_gates(camera_data)
+            self.scan_frames += 1
 
+            # Cas idéal : 4 coins visibles
             for det in detections:
                 if det['has_4_corners']:
                     self.best_area    = det['area']
                     self.best_angle_h = det['angle_h']
                     self.refine_shrink_count = 0
                     self.state = 'refine'
+                    self.scan_frames = 0
                     print(f"[STATE] 4 coins + noir droite (aire={det['area']:.0f}) → refine")
                     break
+
+            # Fallback : si on a cherché trop longtemps sans voir 4 coins, accepter
+            # le plus gros contour même s'il n'a pas exactement 4 coins (gate coupé,
+            # vu de biais, etc.)
+            SCAN_TIMEOUT = 400  # environ ~20 secondes à 50Hz
+            if self.state == 'scan_ccw' and self.scan_frames > SCAN_TIMEOUT and detections:
+                det = detections[0]  # le plus gros (détections triées par aire)
+                self.best_area    = det['area']
+                self.best_angle_h = det['angle_h']
+                self.refine_shrink_count = 0
+                self.state = 'refine'
+                self.scan_frames = 0
+                print(f"[STATE] Timeout scan ({self.scan_frames}f) → refine avec "
+                      f"contour aire={det['area']:.0f} ({det['corner_count']} coins)")
 
             if self.state == 'scan_ccw':
                 new_yaw = self._normalize_angle(yaw + 10 * dt)
@@ -655,9 +637,12 @@ class MyAssignment:
 
         # =====================================================================
         # REFINE : tourner jusqu'à noir gauche aussi → estimer position du gate
+        #   Fallback : si on tourne trop longtemps sans avoir les deux côtés noirs,
+        #   accepter avec le plus gros contour et estimation PnP ou dist_est
         # =====================================================================
         if self.state == 'refine':
             detections, self.debug_mask, mask_ref = detect_gates(camera_data)
+            self.scan_frames += 1
 
             for det in detections:
                 if not det['has_4_corners']:
@@ -671,7 +656,8 @@ class MyAssignment:
                 if mask_ref is not None and left_edge < x:
                     left_strip = mask_ref[y:y+h, left_edge:x]
                     white_ratio_left = np.sum(left_strip > 0) / left_strip.size
-                    has_black_left = (white_ratio_left <= 0.2)
+                    # Seuil assoupli (0.2 → 0.4) pour tolérer les gates proches d'autres gates
+                    has_black_left = (white_ratio_left <= 0.4)
 
                 if has_black_left:
                     # Gate entier visible → estimer sa position 3D
@@ -688,10 +674,33 @@ class MyAssignment:
                     self.gate_rough_pos = np.array([gate_x, gate_y, gate_z])
                     self.lost_count = 0
                     self.last_good_yaw = yaw
+                    self.scan_frames = 0
                     print(f"[STATE] Gate estimé à {self.gate_rough_pos} "
                           f"(dist={'PnP' if det['pnp_dist'] else 'h-ratio'}={dist:.2f}m) → approach")
                     self.state = 'approach'
                     break
+
+            # Fallback refine : si on tourne depuis longtemps sans avoir les deux côtés
+            # noirs, on accepte quand même avec le plus gros contour visible
+            REFINE_TIMEOUT = 200
+            if self.state == 'refine' and self.scan_frames > REFINE_TIMEOUT and detections:
+                det = detections[0]
+                dist         = det['pnp_dist']    if det['pnp_dist']    is not None else \
+                               (det['dist_est']   if det['dist_est']    else 2.0)
+                angle_h_used = det['pnp_angle_h'] if det['pnp_angle_h'] is not None else det['angle_h']
+                angle_v_used = det['pnp_angle_v'] if det['pnp_angle_v'] is not None else det['angle_v']
+                gate_direction = yaw - angle_h_used
+                gate_x = pos[0] + dist * np.cos(gate_direction)
+                gate_y = pos[1] + dist * np.sin(gate_direction)
+                gate_z = pos[2] + dist * np.tan(angle_v_used)
+                gate_z = np.clip(gate_z, 0.5, 2.5)
+                self.gate_rough_pos = np.array([gate_x, gate_y, gate_z])
+                self.lost_count = 0
+                self.last_good_yaw = yaw
+                self.scan_frames = 0
+                print(f"[STATE] Timeout refine → approach (fallback contour partiel "
+                      f"{det['corner_count']} coins, aire={det['area']:.0f})")
+                self.state = 'approach'
 
             if self.state == 'refine':
                 new_yaw = self._normalize_angle(yaw + 10 * dt)
