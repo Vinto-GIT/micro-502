@@ -115,7 +115,7 @@ def detect_gates(image):
         angle_h = (cx - CAM_WIDTH / 2.0) * angle_per_pixel
         angle_v = (CAM_HEIGHT / 2.0 - cy) * (CAM_FOV_V / CAM_HEIGHT)
 
-        MIN_BBOX_SIZE = 20
+        MIN_BBOX_SIZE = 10
         if w < MIN_BBOX_SIZE or h < MIN_BBOX_SIZE:
             continue
 
@@ -232,6 +232,11 @@ class MyAssignment:
         self.lap2_lap_count = 0    # nombre de laps rapides effectués (max 2)
         self.lap2_started   = False  # False tant qu'on n'est pas revenu au décollage
 
+        # Trajectoire polynomiale min-snap pour lap2
+        self.trajectory      = None   # dict {'polys': [...], 'durations': [...], 'total_time': T}
+        self.traj_start_time = None   # temps simulation au démarrage de la trajectoire
+        self.last_time       = 0.0    # temps courant cumulé depuis traj_start_time
+
         # Position réelle au sol enregistrée au premier step (plus fiable que TAKEOFF_POS)
         self.takeoff_pos_recorded = None
 
@@ -283,6 +288,289 @@ class MyAssignment:
         for i, gp in enumerate(ordered):
             print(f"[CCW] Gate {i+1} → {gp} (drone_angle={np.degrees(drone_angle(gp)):.1f}°)")
         return ordered
+
+    def _estimate_gate_normal(self, gate_pos, prev_pos, next_pos):
+        """
+        Estime la normale de traversée d'un gate (direction dans laquelle le drone
+        doit le traverser). La logique : le drone vient du gate précédent, traverse
+        ce gate, puis va vers le gate suivant. La normale est la moyenne des deux
+        directions (tangente locale du chemin).
+
+        Retourne un vecteur 2D unitaire.
+        """
+        dir_in  = np.array(gate_pos[:2]) - np.array(prev_pos[:2])
+        dir_out = np.array(next_pos[:2]) - np.array(gate_pos[:2])
+        d_in  = dir_in  / (np.linalg.norm(dir_in)  + 1e-9)
+        d_out = dir_out / (np.linalg.norm(dir_out) + 1e-9)
+        tangent = (d_in + d_out) / 2.0
+        n = np.linalg.norm(tangent)
+        return tangent / n if n > 1e-6 else d_out
+
+    # =========================================================================
+    # TRAJECTOIRE MIN-SNAP (polynômes d'ordre 7)
+    # =========================================================================
+    def _compute_min_snap_segment(self, p0, v0, a0, j0, p1, v1, a1, j1, T):
+        """
+        Calcule un polynôme d'ordre 7 p(t) = c0 + c1 t + ... + c7 t^7
+        qui passe de (p0, v0, a0, j0) à t=0 à (p1, v1, a1, j1) à t=T.
+
+        Ordre 7 = 8 coefficients, 8 contraintes (4 au début + 4 à la fin)
+        → système linéaire carré résolu exactement.
+
+        Paramètres :
+          p0, v0, a0, j0 : position, vitesse, accélération, jerk de départ
+          p1, v1, a1, j1 : position, vitesse, accélération, jerk d'arrivée
+          T              : durée du segment
+
+        Retourne : np.array([c0, c1, c2, c3, c4, c5, c6, c7]) de taille (8, d)
+                   où d = dimension de p (3 pour x/y/z traités en bloc)
+        """
+        # Matrice des contraintes : chaque ligne = une équation
+        #   p(0) = c0                      → [1, 0, 0, 0, 0, 0, 0, 0]
+        #   v(0) = c1                      → [0, 1, 0, 0, 0, 0, 0, 0]
+        #   a(0) = 2 c2                   → [0, 0, 2, 0, 0, 0, 0, 0]
+        #   j(0) = 6 c3                   → [0, 0, 0, 6, 0, 0, 0, 0]
+        #   p(T) = Σ ck T^k               → [1, T, T², T³, T⁴, T⁵, T⁶, T⁷]
+        #   v(T) = Σ k ck T^(k-1)
+        #   a(T) = Σ k(k-1) ck T^(k-2)
+        #   j(T) = Σ k(k-1)(k-2) ck T^(k-3)
+        A = np.array([
+            [1, 0, 0,  0,     0,      0,       0,         0],
+            [0, 1, 0,  0,     0,      0,       0,         0],
+            [0, 0, 2,  0,     0,      0,       0,         0],
+            [0, 0, 0,  6,     0,      0,       0,         0],
+            [1, T, T**2, T**3,    T**4,      T**5,       T**6,         T**7],
+            [0, 1, 2*T,  3*T**2,  4*T**3,    5*T**4,     6*T**5,       7*T**6],
+            [0, 0, 2,    6*T,    12*T**2,   20*T**3,    30*T**4,      42*T**5],
+            [0, 0, 0,    6,      24*T,      60*T**2,   120*T**3,     210*T**4],
+        ], dtype=np.float64)
+
+        b = np.array([p0, v0, a0, j0, p1, v1, a1, j1], dtype=np.float64)
+        # np.linalg.solve gère les tableaux multi-colonnes : résout pour x, y, z simultanément
+        return np.linalg.solve(A, b)
+
+    def _eval_poly(self, coeffs, t):
+        """Évalue un polynôme et ses dérivées à t. Retourne (pos, vel, acc)."""
+        # coeffs shape : (8, d)  avec d = 3 pour position 3D
+        t_pow  = np.array([t**k for k in range(8)])
+        dt_pow = np.array([k * t**(k-1) if k >= 1 else 0 for k in range(8)])
+        # pos = Σ ck t^k ; on fait un produit scalaire ligne par ligne
+        pos = np.einsum('k,kd->d', t_pow,  coeffs)
+        vel = np.einsum('k,kd->d', dt_pow, coeffs)
+        return pos, vel
+
+    def _compute_trajectory(self, start_pos, waypoints, end_pos,
+                            avg_speed=1.5, gate_speed_factor=0.6):
+        """
+        Calcule une trajectoire min-snap par morceaux entre start_pos, tous les
+        waypoints (passages de gates), et end_pos.
+
+        La trajectoire est composée de N segments polynomiaux d'ordre 7, avec :
+          - Position, vitesse, accélération, jerk continus à chaque joint
+          - Vitesse et accélération nulles aux extrémités (start et end)
+          - Vitesse aux gates imposée dans la direction de la normale, mais RÉDUITE
+            (gate_speed_factor < 1) pour forcer le drone à passer précisément par
+            le centroïde. Moins de vitesse = moins d'inertie = moins d'écart
+            lors du passage.
+          - Durée de chaque segment ∝ longueur / avg_speed
+
+        Paramètres :
+          start_pos          : np.array(3), position de départ
+          waypoints          : liste de dicts {'pos': np.array(3), 'normal': np.array(2)}
+          end_pos            : np.array(3), position finale
+          avg_speed          : vitesse moyenne ciblée entre waypoints (m/s)
+          gate_speed_factor  : facteur ]0,1] appliqué à la vitesse AU centroïde
+                               des gates. 0.6 = traversée 40% plus lente pour
+                               garantir le passage au centre.
+
+        Retourne :
+          dict {'polys':     liste des matrices de coefficients (8, 3) par segment,
+                'durations': liste des durées par segment,
+                'total_time': durée totale}
+        """
+        # Construction de la liste complète de points [start, wp1, wp2, ..., end]
+        all_points = [{'pos': start_pos, 'normal': None}]
+        all_points.extend(waypoints)
+        all_points.append({'pos': end_pos, 'normal': None})
+        N = len(all_points) - 1   # nombre de segments
+
+        gate_speed = avg_speed * gate_speed_factor
+
+        # --- Durées des segments : ∝ distance / vitesse effective du segment ---
+        # On utilise la vitesse "à l'entrée" + "à la sortie" moyennée pour ne pas
+        # faire de saccades. Segments qui touchent un gate → vitesse réduite.
+        durations = []
+        for i in range(N):
+            d = np.linalg.norm(all_points[i+1]['pos'] - all_points[i]['pos'])
+            # Vitesse effective du segment : moyenne des vitesses aux deux bouts
+            # (aux extrémités start/end la vitesse est 0, ailleurs c'est avg_speed)
+            v_in  = 0.0        if i == 0       else gate_speed
+            v_out = 0.0        if i == N-1     else gate_speed
+            v_seg = max((v_in + v_out) / 2.0, 0.3)   # éviter div/0
+            durations.append(max(d / v_seg, 0.6))    # minimum 0.6s pour stabilité
+
+        # --- Vitesse cible à chaque point ---
+        # start et end : vitesse nulle
+        # waypoints intermédiaires : vitesse dans la direction de la normale (2D)
+        #                            magnitude = gate_speed (réduite !)
+        velocities = [np.zeros(3)]
+        for i in range(1, N):
+            wp = all_points[i]
+            if wp['normal'] is not None:
+                n = wp['normal']
+                v = np.array([n[0] * gate_speed, n[1] * gate_speed, 0.0])
+            else:
+                dp = all_points[i+1]['pos'] - all_points[i-1]['pos']
+                dp = dp / (np.linalg.norm(dp) + 1e-9) * gate_speed
+                v = dp
+            velocities.append(v)
+        velocities.append(np.zeros(3))  # end : vitesse nulle
+
+        # --- Accélération et jerk nuls partout (simplification pragmatique) ---
+        accs  = [np.zeros(3) for _ in range(N + 1)]
+        jerks = [np.zeros(3) for _ in range(N + 1)]
+
+        # --- Calcul des polynômes segment par segment ---
+        polys = []
+        for i in range(N):
+            p0 = all_points[i]['pos']
+            p1 = all_points[i+1]['pos']
+            coeffs = self._compute_min_snap_segment(
+                p0, velocities[i],   accs[i],   jerks[i],
+                p1, velocities[i+1], accs[i+1], jerks[i+1],
+                durations[i]
+            )
+            polys.append(coeffs)
+
+        total_time = sum(durations)
+        print(f"[TRAJ] {N} segments, durée totale = {total_time:.2f}s, "
+              f"vitesse cruise = {avg_speed:.1f}m/s, gate = {gate_speed:.1f}m/s")
+
+        return {'polys': polys, 'durations': durations, 'total_time': total_time}
+
+    def _sample_trajectory(self, traj, t):
+        """
+        Évalue la trajectoire à l'instant global t.
+        Retourne la position (np.array(3)) et la vitesse (np.array(3)).
+
+        Si t dépasse total_time, retourne la position finale avec vitesse nulle.
+        """
+        if t >= traj['total_time']:
+            # Fin de trajectoire : évaluer le dernier segment à sa durée max
+            last_poly = traj['polys'][-1]
+            last_dur  = traj['durations'][-1]
+            pos, _ = self._eval_poly(last_poly, last_dur)
+            return pos, np.zeros(3)
+
+        # Trouver le segment courant et le temps local
+        t_local = t
+        for i, dur in enumerate(traj['durations']):
+            if t_local <= dur:
+                pos, vel = self._eval_poly(traj['polys'][i], t_local)
+                return pos, vel
+            t_local -= dur
+
+        # Sécurité (ne devrait pas arriver)
+        last_poly = traj['polys'][-1]
+        last_dur  = traj['durations'][-1]
+        pos, _ = self._eval_poly(last_poly, last_dur)
+        return pos, np.zeros(3)
+
+    def _build_lap2_waypoints_shrunk(self, ordered_gates, start_pos, shrink_factor=0.3):
+        """
+        Construit la liste des waypoints pour 2 tours à partir des gates ordonnés
+        (liste de np.array([x, y, z])).
+
+        Pour chaque gate on calcule sa normale = tangente locale du chemin
+        (direction moyenne gate_précédent → gate → gate_suivant). Cette normale
+        sert à imposer la direction de traversée dans la trajectoire.
+
+        Pour atterrir pile au centre du gate, on utilise le centroïde exact
+        (shrink_factor = 0 signifie pas de décalage). Le paramètre est gardé
+        pour pouvoir éloigner du bord si besoin.
+
+        Retourne : liste de dicts {'pos': np.array(3), 'normal': np.array(2)}
+                   répétée 2 fois pour 2 laps.
+        """
+        n = len(ordered_gates)
+        base_waypoints = []
+        for i, g in enumerate(ordered_gates):
+            # Pour la normale : point précédent = gate i-1 (ou start pour i=0)
+            #                   point suivant  = gate i+1 (ou gate 0 pour i=n-1, boucle)
+            prev_pos = ordered_gates[i - 1] if i > 0 else start_pos
+            next_pos = ordered_gates[(i + 1) % n]
+            normal   = self._estimate_gate_normal(g, prev_pos, next_pos)
+
+            base_waypoints.append({
+                'pos':    np.array(g, dtype=np.float64).copy(),
+                'normal': normal,
+            })
+        # Répéter pour 2 laps
+        return base_waypoints + base_waypoints
+
+    def _plot_trajectory(self, traj, ordered_gates, waypoints, start_pos, end_pos,
+                         filename='trajectory.png'):
+        """
+        Génère un plot 3D de la trajectoire complète avec les gates.
+        Sauvegardé en PNG à la racine du projet Webots.
+
+        ordered_gates : liste des np.array([x, y, z]) (centroïdes uniquement)
+        waypoints     : liste de dicts {'pos', 'normal'} (contient normales estimées)
+        """
+        try:
+            import matplotlib.pyplot as plt
+            from mpl_toolkits.mplot3d import Axes3D  # noqa
+        except ImportError:
+            print("[PLOT] matplotlib non disponible — plot ignoré")
+            return
+
+        # Échantillonner la trajectoire à haute résolution pour le tracé
+        t_samples = np.linspace(0, traj['total_time'], 500)
+        path = np.array([self._sample_trajectory(traj, t)[0] for t in t_samples])
+
+        fig = plt.figure(figsize=(10, 8))
+        ax  = fig.add_subplot(111, projection='3d')
+
+        # Trajectoire
+        ax.plot(path[:, 0], path[:, 1], path[:, 2], 'k-', lw=2, label='Trajectoire min-snap')
+
+        # Gates : rectangle dans le plan perpendiculaire à la normale
+        # On n'a pas accès aux coins 3D, donc on dessine un rectangle symbolique
+        # de taille GATE_REAL_WIDTH × GATE_REAL_HEIGHT centré sur le centroïde
+        for i, g in enumerate(ordered_gates):
+            # Normale du gate (depuis les waypoints du premier lap)
+            n = waypoints[i]['normal'] if i < len(waypoints) else np.array([1.0, 0.0])
+            # Vecteur tangent dans le plan XY (perpendiculaire à n)
+            tangent = np.array([-n[1], n[0], 0.0])
+            up      = np.array([0.0, 0.0, 1.0])
+            half_w  = GATE_REAL_WIDTH  / 2.0
+            half_h  = GATE_REAL_HEIGHT / 2.0
+            corners = np.array([
+                g + tangent * half_w + up * half_h,
+                g - tangent * half_w + up * half_h,
+                g - tangent * half_w - up * half_h,
+                g + tangent * half_w - up * half_h,
+                g + tangent * half_w + up * half_h,  # fermer
+            ])
+            ax.plot(corners[:, 0], corners[:, 1], corners[:, 2], 'r-', lw=2)
+            ax.scatter(*g, c='cyan', s=80, edgecolors='k', zorder=5)
+            ax.text(g[0], g[1], g[2] + 0.15, f'G{i+1}', fontsize=10, ha='center')
+
+        # Start / end
+        ax.scatter(*start_pos, c='green', s=120, marker='o', label='Start', edgecolors='k', zorder=5)
+        ax.scatter(*end_pos,   c='red',   s=120, marker='X', label='End',   edgecolors='k', zorder=5)
+
+        ax.set_xlabel('X [m]'); ax.set_ylabel('Y [m]'); ax.set_zlabel('Z [m]')
+        ax.set_title(f"Trajectoire min-snap ({traj['total_time']:.1f}s)")
+        ax.legend()
+        ax.set_box_aspect([1, 1, 0.4])
+
+        try:
+            plt.savefig(filename, dpi=100, bbox_inches='tight')
+            print(f"[PLOT] Trajectoire sauvegardée → {filename}")
+            plt.close(fig)
+        except Exception as e:
+            print(f"[PLOT] Erreur sauvegarde : {e}")
 
     def _closest_detection_to_target(self, detections, pos, yaw):
         """
@@ -520,6 +808,8 @@ class MyAssignment:
                     self.lap2_gate_idx  = 0
                     self.lap2_lap_count = 0
                     self.lap2_started   = False  # devra d'abord revenir au décollage
+                    self.trajectory     = None   # sera calculée après retour au home
+                    self.traj_start_time = None
                     print(f"[STATE] {NUM_GATES} gates trouvés et réordonnés → lap2 (retour décollage)")
                     self.state = 'lap2'
                 else:
@@ -556,13 +846,11 @@ class MyAssignment:
                 return [pos[0], pos[1], CRUISE_ALT, yaw]
 
         # =====================================================================
-        # LAP2 : voler à travers les gates connus dans l'ordre CCW, 2 fois
+        # LAP2 : trajectoire polynomiale min-snap à travers les gates, 2 tours
         #   - Phase 0 : retourner au pad de décollage avant de démarrer
-        #   - Cible = centroïde du gate courant (pas de waypoints approach/exit)
-        #   - "Carotte" step-limitée : on avance le setpoint de quelques cm/tick
-        #     dans la direction du gate au lieu de lui envoyer la position finale,
-        #     pour que le PID reste stable au lieu de pousser à fond
-        #   - Anticipation du yaw vers le gate suivant dès 1.5 m
+        #   - Phase 1 : calculer la trajectoire min-snap une seule fois
+        #               (polynômes d'ordre 7 continus C³ à chaque gate)
+        #   - Phase 2 : suivre la trajectoire en évaluant pos(t) à chaque tick
         # =====================================================================
         if self.state == 'lap2':
 
@@ -574,71 +862,53 @@ class MyAssignment:
                 dy_h = home[1] - pos[1]
                 dist_home = np.linalg.norm([dx_h, dy_h])
                 if dist_home < 0.4:
-                    self.lap2_started  = True
-                    self.lap2_gate_idx = 0
-                    print("[LAP2] Pad de décollage atteint → début des laps rapides")
+                    self.lap2_started = True
+                    print("[LAP2] Pad de décollage atteint → calcul trajectoire")
                 else:
                     target_yaw = np.arctan2(dy_h, dx_h)
                     return [float(home[0]), float(home[1]), CRUISE_ALT, target_yaw]
 
-            # -- Fin d'un tour : passer au suivant ou terminer --
-            if self.lap2_gate_idx >= NUM_GATES:
-                self.lap2_lap_count += 1
-                self.lap2_gate_idx   = 0
-                if self.lap2_lap_count >= 2:
-                    print("[STATE] 2 laps rapides terminés → finished")
-                    self.state = 'finished'
-                    return [pos[0], pos[1], CRUISE_ALT, yaw]
-                print(f"[LAP2] Tour {self.lap2_lap_count + 1}/2 — retour gate 1")
-
-            target = self.gate_positions[self.lap2_gate_idx]
-            dx     = target[0] - pos[0]
-            dy     = target[1] - pos[1]
-            dz     = target[2] - pos[2]
-            dist_h = np.linalg.norm([dx, dy])
-
-            # Gate considéré comme traversé quand on est assez proche
-            GATE_PASS_DIST = 0.1
-            if dist_h < GATE_PASS_DIST:
-                print(f"[LAP2] Gate {self.lap2_gate_idx + 1}/{NUM_GATES} traversé "
-                      f"(tour {self.lap2_lap_count + 1}/2)")
-                self.lap2_gate_idx += 1
-                return [pos[0], pos[1], float(target[2]), yaw]
-
-            # Anticipation du yaw : orienter vers le gate suivant dès 1.5 m
-            # pour ne pas s'arrêter et pivoter sur place entre deux gates
-            ANTICIPATE_DIST = 1.5
-            next_idx    = (self.lap2_gate_idx + 1) % NUM_GATES
-            next_target = self.gate_positions[next_idx]
-
-            if dist_h < ANTICIPATE_DIST:
-                alpha_yaw   = 1.0 - (dist_h / ANTICIPATE_DIST)
-                yaw_current = np.arctan2(dy, dx)
-                dx_next     = next_target[0] - pos[0]
-                dy_next     = next_target[1] - pos[1]
-                yaw_next    = np.arctan2(dy_next, dx_next)
-                target_yaw  = self._normalize_angle(
-                    yaw_current + alpha_yaw * self._angle_diff(yaw_next, yaw_current)
+            # -- Phase 1 : calculer la trajectoire min-snap (une seule fois) --
+            if self.trajectory is None:
+                start_pos = np.array([pos[0], pos[1], CRUISE_ALT])
+                waypoints = self._build_lap2_waypoints_shrunk(
+                    self.gate_positions, start_pos
                 )
+                end_pos = start_pos.copy()   # retour au point de départ après 2 laps
+                self.trajectory = self._compute_trajectory(
+                    start_pos, waypoints, end_pos,
+                    avg_speed=1.5,             # vitesse cruise (m/s) — à tuner
+                    gate_speed_factor=0.6      # 60% de avg_speed au centroïde des gates
+                                               # → traversée lente et précise
+                )
+                self.traj_start_time = sensor_data.get('t', 0.0)
+                # Plot de la trajectoire (une seule fois)
+                self._plot_trajectory(self.trajectory, self.gate_positions,
+                                      waypoints, start_pos, end_pos,
+                                      filename='lap2_trajectory.png')
+
+            # -- Phase 2 : suivre la trajectoire --
+            t_now   = sensor_data.get('t', 0.0)
+            t_local = t_now - self.traj_start_time
+
+            # Fin de trajectoire
+            if t_local >= self.trajectory['total_time']:
+                print("[STATE] Trajectoire min-snap terminée → finished")
+                self.state = 'finished'
+                return [pos[0], pos[1], CRUISE_ALT, yaw]
+
+            # Évaluer pos(t) et vel(t) pour ce tick
+            target_pos, target_vel = self._sample_trajectory(self.trajectory, t_local)
+
+            # Yaw = direction du mouvement (tangent à la trajectoire)
+            vxy_norm = np.linalg.norm(target_vel[:2])
+            if vxy_norm > 0.1:
+                target_yaw = np.arctan2(target_vel[1], target_vel[0])
             else:
-                target_yaw = np.arctan2(dy, dx)
+                target_yaw = yaw  # vitesse trop faible : garder le cap actuel
 
-            # Carotte step-limitée : le PID suit une cible proche et stable
-            # au lieu d'une cible lointaine à plein régime
-            LAP2_SPEED_XY = 0.5    # m par tick horizontal
-            LAP2_SPEED_Z  = 0.2    # m par tick vertical
-
-            step_xy = min(LAP2_SPEED_XY, dist_h)
-            move_x  = pos[0] + step_xy * (dx / dist_h)
-            move_y  = pos[1] + step_xy * (dy / dist_h)
-
-            # Cible Z limitée aussi pour éviter les sauts verticaux brutaux
-            if abs(dz) < 0.01:
-                move_z = float(target[2])
-            else:
-                move_z = pos[2] + np.sign(dz) * min(abs(dz), LAP2_SPEED_Z)
-
-            return [float(move_x), float(move_y), float(move_z), target_yaw]
+            return [float(target_pos[0]), float(target_pos[1]),
+                    float(target_pos[2]), float(target_yaw)]
 
         # =====================================================================
         # FINISHED
