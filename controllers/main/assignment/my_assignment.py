@@ -329,7 +329,24 @@ class MyAssignment:
 
         Ordre 7 = 8 coefficients, 8 contraintes (4 au début + 4 à la fin)
         → système linéaire carré résolu exactement.
+
+        Paramètres :
+          p0, v0, a0, j0 : position, vitesse, accélération, jerk de départ
+          p1, v1, a1, j1 : position, vitesse, accélération, jerk d'arrivée
+          T              : durée du segment
+
+        Retourne : np.array([c0, c1, c2, c3, c4, c5, c6, c7]) de taille (8, d)
+                   où d = dimension de p (3 pour x/y/z traités en bloc)
         """
+        # Matrice des contraintes : chaque ligne = une équation
+        #   p(0) = c0                      → [1, 0, 0, 0, 0, 0, 0, 0]
+        #   v(0) = c1                      → [0, 1, 0, 0, 0, 0, 0, 0]
+        #   a(0) = 2 c2                   → [0, 0, 2, 0, 0, 0, 0, 0]
+        #   j(0) = 6 c3                   → [0, 0, 0, 6, 0, 0, 0, 0]
+        #   p(T) = Σ ck T^k               → [1, T, T², T³, T⁴, T⁵, T⁶, T⁷]
+        #   v(T) = Σ k ck T^(k-1)
+        #   a(T) = Σ k(k-1) ck T^(k-2)
+        #   j(T) = Σ k(k-1)(k-2) ck T^(k-3)
         A = np.array([
             [1, 0, 0,  0,     0,      0,       0,         0],
             [0, 1, 0,  0,     0,      0,       0,         0],
@@ -342,34 +359,47 @@ class MyAssignment:
         ], dtype=np.float64)
 
         b = np.array([p0, v0, a0, j0, p1, v1, a1, j1], dtype=np.float64)
+        # np.linalg.solve gère les tableaux multi-colonnes : résout pour x, y, z simultanément
         return np.linalg.solve(A, b)
 
     def _eval_poly(self, coeffs, t):
-        """Évalue un polynôme et ses dérivées à t. Retourne (pos, vel)."""
+        """Évalue un polynôme et ses dérivées à t. Retourne (pos, vel, acc)."""
+        # coeffs shape : (8, d)  avec d = 3 pour position 3D
         t_pow  = np.array([t**k for k in range(8)])
         dt_pow = np.array([k * t**(k-1) if k >= 1 else 0 for k in range(8)])
+        # pos = Σ ck t^k ; on fait un produit scalaire ligne par ligne
         pos = np.einsum('k,kd->d', t_pow,  coeffs)
         vel = np.einsum('k,kd->d', dt_pow, coeffs)
         return pos, vel
 
     def _compute_trajectory(self, start_pos, waypoints, end_pos,
-                            avg_speed=1.5, gate_speed_factor=0.6):
+                            avg_speed= 2, gate_speed_factor=0.5):
         """
-        Calcule une trajectoire min-snap par morceaux.
+        Calcule une trajectoire min-snap par morceaux entre start_pos, tous les
+        waypoints (passages de gates), et end_pos.
 
-        - Entre deux gates : durée = distance / avg_speed (vitesse cruise PLEINE).
-          Le drone peut donc réellement accélérer sur les portions rectilignes.
-        - Au centroïde des gates : vitesse réduite à gate_speed = avg_speed * gate_speed_factor
-          pour garantir un passage précis au centre sans trop d'inertie latérale.
-        - Aux extrémités (start/end) : vitesse nulle.
+        La trajectoire est composée de N segments polynomiaux d'ordre 7, avec :
+          - Position, vitesse, accélération, jerk continus à chaque joint
+          - Vitesse et accélération nulles aux extrémités (start et end)
+          - Vitesse aux gates imposée dans la direction de la normale, mais RÉDUITE
+            (gate_speed_factor < 1) pour forcer le drone à passer précisément par
+            le centroïde. Moins de vitesse = moins d'inertie = moins d'écart
+            lors du passage.
+          - Durée de chaque segment ∝ longueur / avg_speed
 
         Paramètres :
-          avg_speed          : vitesse CRUISE entre gates (m/s) → monter pour + rapide
-          gate_speed_factor  : facteur ]0,1] appliqué à la vitesse AU centroïde des gates
-                               (plus bas = passage plus précis mais décélération marquée)
+          start_pos          : np.array(3), position de départ
+          waypoints          : liste de dicts {'pos': np.array(3), 'normal': np.array(2)}
+          end_pos            : np.array(3), position finale
+          avg_speed          : vitesse moyenne ciblée entre waypoints (m/s)
+          gate_speed_factor  : facteur ]0,1] appliqué à la vitesse AU centroïde
+                               des gates. 0.6 = traversée 40% plus lente pour
+                               garantir le passage au centre.
 
         Retourne :
-          dict {'polys': liste des (8,3) coeffs, 'durations': [...], 'total_time': T}
+          dict {'polys':     liste des matrices de coefficients (8, 3) par segment,
+                'durations': liste des durées par segment,
+                'total_time': durée totale}
         """
         # Construction de la liste complète de points [start, wp1, wp2, ..., end]
         all_points = [{'pos': start_pos, 'normal': None}]
@@ -379,11 +409,9 @@ class MyAssignment:
 
         gate_speed = avg_speed * gate_speed_factor
 
-        # --- Durées des segments : ∝ distance / avg_speed (cruise plein) ---
-        # Entre deux gates, le drone doit parcourir la distance à la vitesse cruise.
-        # La vitesse imposée AU gate est réduite (gate_speed), mais la vitesse
-        # MOYENNE dans le segment est proche de avg_speed car le drone accélère
-        # entre les deux extrémités.
+        # --- Durées des segments : ∝ distance / vitesse effective du segment ---
+        # On utilise la vitesse "à l'entrée" + "à la sortie" moyennée pour ne pas
+        # faire de saccades. Segments qui touchent un gate → vitesse réduite.
         durations = []
         for i in range(N):
             d = np.linalg.norm(all_points[i+1]['pos'] - all_points[i]['pos'])
@@ -429,21 +457,25 @@ class MyAssignment:
 
         total_time = sum(durations)
         print(f"[TRAJ] {N} segments, durée totale = {total_time:.2f}s, "
-              f"cruise = {avg_speed:.1f}m/s, gate = {gate_speed:.1f}m/s")
+              f"vitesse cruise = {avg_speed:.1f}m/s, gate = {gate_speed:.1f}m/s")
 
         return {'polys': polys, 'durations': durations, 'total_time': total_time}
 
     def _sample_trajectory(self, traj, t):
         """
         Évalue la trajectoire à l'instant global t.
-        Retourne (position np.array(3), vitesse np.array(3)).
+        Retourne la position (np.array(3)) et la vitesse (np.array(3)).
+
+        Si t dépasse total_time, retourne la position finale avec vitesse nulle.
         """
         if t >= traj['total_time']:
+            # Fin de trajectoire : évaluer le dernier segment à sa durée max
             last_poly = traj['polys'][-1]
             last_dur  = traj['durations'][-1]
             pos, _ = self._eval_poly(last_poly, last_dur)
             return pos, np.zeros(3)
 
+        # Trouver le segment courant et le temps local
         t_local = t
         for i, dur in enumerate(traj['durations']):
             if t_local <= dur:
@@ -451,6 +483,7 @@ class MyAssignment:
                 return pos, vel
             t_local -= dur
 
+        # Sécurité (ne devrait pas arriver)
         last_poly = traj['polys'][-1]
         last_dur  = traj['durations'][-1]
         pos, _ = self._eval_poly(last_poly, last_dur)
@@ -475,6 +508,8 @@ class MyAssignment:
         n = len(ordered_gates)
         base_waypoints = []
         for i, g in enumerate(ordered_gates):
+            # Pour la normale : point précédent = gate i-1 (ou start pour i=0)
+            #                   point suivant  = gate i+1 (ou gate 0 pour i=n-1, boucle)
             prev_pos = ordered_gates[i - 1] if i > 0 else start_pos
             next_pos = ordered_gates[(i + 1) % n]
             normal   = self._estimate_gate_normal(g, prev_pos, next_pos)
@@ -483,11 +518,18 @@ class MyAssignment:
                 'pos':    np.array(g, dtype=np.float64).copy(),
                 'normal': normal,
             })
+        # Répéter pour 2 laps
         return base_waypoints + base_waypoints
 
     def _plot_trajectory(self, traj, ordered_gates, waypoints, start_pos, end_pos,
                          filename='trajectory.png'):
-        """Plot 3D de la trajectoire min-snap avec les gates."""
+        """
+        Génère un plot 3D de la trajectoire complète avec les gates.
+        Sauvegardé en PNG à la racine du projet Webots.
+
+        ordered_gates : liste des np.array([x, y, z]) (centroïdes uniquement)
+        waypoints     : liste de dicts {'pos', 'normal'} (contient normales estimées)
+        """
         try:
             import matplotlib.pyplot as plt
             from mpl_toolkits.mplot3d import Axes3D  # noqa
@@ -495,16 +537,23 @@ class MyAssignment:
             print("[PLOT] matplotlib non disponible — plot ignoré")
             return
 
+        # Échantillonner la trajectoire à haute résolution pour le tracé
         t_samples = np.linspace(0, traj['total_time'], 500)
         path = np.array([self._sample_trajectory(traj, t)[0] for t in t_samples])
 
         fig = plt.figure(figsize=(10, 8))
         ax  = fig.add_subplot(111, projection='3d')
 
+        # Trajectoire
         ax.plot(path[:, 0], path[:, 1], path[:, 2], 'k-', lw=2, label='Trajectoire min-snap')
 
+        # Gates : rectangle dans le plan perpendiculaire à la normale
+        # On n'a pas accès aux coins 3D, donc on dessine un rectangle symbolique
+        # de taille GATE_REAL_WIDTH × GATE_REAL_HEIGHT centré sur le centroïde
         for i, g in enumerate(ordered_gates):
+            # Normale du gate (depuis les waypoints du premier lap)
             n = waypoints[i]['normal'] if i < len(waypoints) else np.array([1.0, 0.0])
+            # Vecteur tangent dans le plan XY (perpendiculaire à n)
             tangent = np.array([-n[1], n[0], 0.0])
             up      = np.array([0.0, 0.0, 1.0])
             half_w  = GATE_REAL_WIDTH  / 2.0
@@ -514,12 +563,13 @@ class MyAssignment:
                 g - tangent * half_w + up * half_h,
                 g - tangent * half_w - up * half_h,
                 g + tangent * half_w - up * half_h,
-                g + tangent * half_w + up * half_h,
+                g + tangent * half_w + up * half_h,  # fermer
             ])
             ax.plot(corners[:, 0], corners[:, 1], corners[:, 2], 'r-', lw=2)
             ax.scatter(*g, c='cyan', s=80, edgecolors='k', zorder=5)
             ax.text(g[0], g[1], g[2] + 0.15, f'G{i+1}', fontsize=10, ha='center')
 
+        # Start / end
         ax.scatter(*start_pos, c='green', s=120, marker='o', label='Start', edgecolors='k', zorder=5)
         ax.scatter(*end_pos,   c='red',   s=120, marker='X', label='End',   edgecolors='k', zorder=5)
 
