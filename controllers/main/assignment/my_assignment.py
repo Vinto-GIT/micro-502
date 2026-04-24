@@ -30,14 +30,12 @@ GATE_OBJ_POINTS = np.array([[-_hw, -_hh, 0.0],   # TL
                             dtype=np.float32)
 
 # =============================================================================
-# PARAMÈTRES FILTRE HSV
+# PARAMÈTRES FILTRE HSV  (une seule plage, à ajuster selon l'éclairage)
 # =============================================================================
-HSV_LOWER_MAG1 = np.array([140,  80,  80])
-HSV_UPPER_MAG1 = np.array([180, 255, 255])
-HSV_LOWER_MAG2 = np.array([  0,  80,  80])
-HSV_UPPER_MAG2 = np.array([ 15, 255, 255])
+HSV_LOWER_MAG1 = np.array([138,  20,  110])
+HSV_UPPER_MAG1 = np.array([158, 210, 255])
 
-MIN_CONTOUR_AREA = 200
+MIN_CONTOUR_AREA = 400
 
 NUM_GATES = 5
 OVERFLY_ALT = 2.0          # altitude pour passer au-dessus du gate
@@ -82,9 +80,7 @@ def detect_gates(image):
 
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
-    mask1 = cv2.inRange(hsv, HSV_LOWER_MAG1, HSV_UPPER_MAG1)
-    mask2 = cv2.inRange(hsv, HSV_LOWER_MAG2, HSV_UPPER_MAG2)
-    mask  = cv2.bitwise_or(mask1, mask2)
+    mask = cv2.inRange(hsv, HSV_LOWER_MAG1, HSV_UPPER_MAG1)
 
     kernel_open  = np.ones((5,  5),  np.uint8)
     kernel_close = np.ones((15, 15), np.uint8)
@@ -115,14 +111,14 @@ def detect_gates(image):
         angle_h = (cx - CAM_WIDTH / 2.0) * angle_per_pixel
         angle_v = (CAM_HEIGHT / 2.0 - cy) * (CAM_FOV_V / CAM_HEIGHT)
 
-        MIN_BBOX_SIZE = 15
+        MIN_BBOX_SIZE = 10
         if w < MIN_BBOX_SIZE or h < MIN_BBOX_SIZE:
             continue
 
         # Rejeter les contours très allongés (probablement du bruit ou des barres isolées
         # d'un gate, pas le gate entier). Un gate vu même de biais garde un ratio raisonnable.
         aspect_ratio = w / max(h, 1)
-        if aspect_ratio > 4.0 or aspect_ratio < 0.25:
+        if aspect_ratio > 3.0 or aspect_ratio < 0.33:
             continue
 
         # Filtre noir à droite : s'assure que le gate détecté est isolé à sa droite
@@ -230,6 +226,13 @@ class MyAssignment:
         # on accepte le plus gros contour comme fallback
         self.scan_frames = 0
 
+        # Stop-and-detect en scan_ccw :
+        # Le drone alterne entre rotation (SCAN_ROT_FRAMES frames) et pause
+        # (SCAN_PAUSE_FRAMES frames) pour laisser l'image se stabiliser avant
+        # de tenter la détection. Détection uniquement pendant la pause.
+        self.scan_phase        = 'rotate'   # 'rotate' ou 'pause'
+        self.scan_phase_frames = 0          # frames écoulées dans la phase courante
+
         # Position estimée du gate courant (lissée)
         self.gate_rough_pos  = None
         self.lost_count      = 0
@@ -261,6 +264,8 @@ class MyAssignment:
         self.best_angle_h = None
         self.refine_shrink_count = 0
         self.scan_frames = 0
+        self.scan_phase = 'rotate'
+        self.scan_phase_frames = 0
 
     def _reorder_gates_ccw(self, gate_positions):
         """
@@ -373,7 +378,7 @@ class MyAssignment:
         return pos, vel
 
     def _compute_trajectory(self, start_pos, waypoints, end_pos,
-                            avg_speed= 2, gate_speed_factor=0.5):
+                            avg_speed=3, gate_speed_factor=0.7):
         """
         Calcule une trajectoire min-snap par morceaux entre start_pos, tous les
         waypoints (passages de gates), et end_pos.
@@ -385,15 +390,14 @@ class MyAssignment:
             (gate_speed_factor < 1) pour forcer le drone à passer précisément par
             le centroïde. Moins de vitesse = moins d'inertie = moins d'écart
             lors du passage.
-          - Durée de chaque segment ∝ longueur / avg_speed
+          - Durée de chaque segment : d / avg_speed (cruise plein).
+            Plafond 5s pour éviter l'instabilité numérique du polynôme d'ordre 7
+            (T^7 explose si T est grand, rendant les coefficients aberrants).
 
         Paramètres :
-          start_pos          : np.array(3), position de départ
-          waypoints          : liste de dicts {'pos': np.array(3), 'normal': np.array(2)}
-          end_pos            : np.array(3), position finale
-          avg_speed          : vitesse moyenne ciblée entre waypoints (m/s)
+          avg_speed          : vitesse CRUISE entre gates (m/s) → monter pour + rapide
           gate_speed_factor  : facteur ]0,1] appliqué à la vitesse AU centroïde
-                               des gates. 0.6 = traversée 40% plus lente pour
+                               des gates. 0.7 = traversée 30% plus lente pour
                                garantir le passage au centre.
 
         Retourne :
@@ -409,18 +413,15 @@ class MyAssignment:
 
         gate_speed = avg_speed * gate_speed_factor
 
-        # --- Durées des segments : ∝ distance / vitesse effective du segment ---
-        # On utilise la vitesse "à l'entrée" + "à la sortie" moyennée pour ne pas
-        # faire de saccades. Segments qui touchent un gate → vitesse réduite.
+        # --- Durées des segments : d / avg_speed (cruise plein) ---
+        # Ce calcul utilise avg_speed DIRECTEMENT → monter avg_speed = aller plus vite.
+        # Plancher 0.3s : évite les segments trop courts numériquement instables.
+        # Plafond  5.0s : évite T^7 énorme qui rend les coefficients aberrants
+        #                 (trajectoire qui "explose" entre deux waypoints).
         durations = []
         for i in range(N):
             d = np.linalg.norm(all_points[i+1]['pos'] - all_points[i]['pos'])
-            # Vitesse effective du segment : moyenne des vitesses aux deux bouts
-            # (aux extrémités start/end la vitesse est 0, ailleurs c'est avg_speed)
-            v_in  = 0.0        if i == 0       else gate_speed
-            v_out = 0.0        if i == N-1     else gate_speed
-            v_seg = max((v_in + v_out) / 2.0, 0.3)   # éviter div/0
-            durations.append(max(d / v_seg, 0.6))    # minimum 0.6s pour stabilité
+            durations.append(float(np.clip(d / avg_speed, 0.3, 5.0)))
 
         # --- Vitesse cible à chaque point ---
         # start et end : vitesse nulle
@@ -489,18 +490,28 @@ class MyAssignment:
         pos, _ = self._eval_poly(last_poly, last_dur)
         return pos, np.zeros(3)
 
-    def _build_lap2_waypoints_shrunk(self, ordered_gates, start_pos, shrink_factor=0.3):
+    # =========================================================================
+    # MODIFICATION : waypoint décalé à droite du gate pour compenser l'inertie
+    # =========================================================================
+    def _build_lap2_waypoints_shrunk(self, ordered_gates, start_pos,
+                                     lateral_offset=0.07):
         """
         Construit la liste des waypoints pour 2 tours à partir des gates ordonnés
         (liste de np.array([x, y, z])).
 
         Pour chaque gate on calcule sa normale = tangente locale du chemin
-        (direction moyenne gate_précédent → gate → gate_suivant). Cette normale
-        sert à imposer la direction de traversée dans la trajectoire.
+        (direction moyenne gate_précédent → gate → gate_suivant).
 
-        Pour atterrir pile au centre du gate, on utilise le centroïde exact
-        (shrink_factor = 0 signifie pas de décalage). Le paramètre est gardé
-        pour pouvoir éloigner du bord si besoin.
+        Le waypoint visé est décalé latéralement par rapport au centroïde.
+        Quand le drone va vite en CCW, l'inertie le pousse vers l'extérieur
+        du virage (gauche dans le sens de traversée). En décalant le waypoint
+        vers la DROITE, on compense ce drift pour que le drone passe dans le gate.
+
+          "Droite" dans le sens de traversée :
+          si normale = (nx, ny)  →  droite = (ny, -nx)   [rotation de -90°]
+
+        lateral_offset > 0 → décalage vers la droite (compense dérive CCW)
+        lateral_offset = 0 → centroïde exact (pas de compensation)
 
         Retourne : liste de dicts {'pos': np.array(3), 'normal': np.array(2)}
                    répétée 2 fois pour 2 laps.
@@ -514,8 +525,17 @@ class MyAssignment:
             next_pos = ordered_gates[(i + 1) % n]
             normal   = self._estimate_gate_normal(g, prev_pos, next_pos)
 
+            # Vecteur perpendiculaire à droite de la normale (rotation de -90°) :
+            #   normale (nx, ny)  →  droite (ny, -nx)
+            right_2d = np.array([normal[1], -normal[0]])
+
+            # Position visée = centroïde + offset latéral vers la droite
+            g_target = np.array(g, dtype=np.float64).copy()
+            g_target[0] += lateral_offset * right_2d[0]
+            g_target[1] += lateral_offset * right_2d[1]
+
             base_waypoints.append({
-                'pos':    np.array(g, dtype=np.float64).copy(),
+                'pos':    g_target,
                 'normal': normal,
             })
         # Répéter pour 2 laps
@@ -648,42 +668,69 @@ class MyAssignment:
             return [pos[0], pos[1], CRUISE_ALT, self.yaw_90_target]
 
         # =====================================================================
-        # SCAN_CCW : tourner CCW jusqu'à 4 coins + noir droite
-        #   Fallback : si on tourne depuis très longtemps sans trouver 4 coins,
-        #   accepter le plus gros contour (partiellement visible) pour ne pas rester bloqué
+        # SCAN_CCW : rotation CCW par petites impulsions, avec pauses de détection
+        #
+        # Principe stop-and-detect :
+        #   - Phase 'rotate' (SCAN_ROT_FRAMES frames)   : tourner CCW, pas de détection
+        #   - Phase 'pause'  (SCAN_PAUSE_FRAMES frames) : immobile, détecter le violet
+        #
+        # La détection n'a lieu QUE pendant la pause, quand l'image est stable.
+        # Fallback : après SCAN_TIMEOUT frames totales sans succès, accepter le
+        # plus gros contour visible même sans 4 coins.
         # =====================================================================
         if self.state == 'scan_ccw':
-            detections, self.debug_mask, _ = detect_gates(camera_data)
-            self.scan_frames += 1
+            SCAN_ROT_FRAMES   = 12   # frames de rotation (~0.24s à 50Hz) → ~20° par impulsion
+            SCAN_PAUSE_FRAMES = 12   # frames d'arrêt pour laisser l'image se stabiliser
+            SCAN_TIMEOUT      = 400  # frames totales avant fallback (~8s à 50Hz)
 
-            # Cas idéal : 4 coins visibles
-            for det in detections:
-                if det['has_4_corners']:
+            self.scan_frames       += 1
+            self.scan_phase_frames += 1
+
+            # --- Transition entre phases ---
+            if self.scan_phase == 'rotate' and self.scan_phase_frames >= SCAN_ROT_FRAMES:
+                self.scan_phase        = 'pause'
+                self.scan_phase_frames = 0
+            elif self.scan_phase == 'pause' and self.scan_phase_frames >= SCAN_PAUSE_FRAMES:
+                self.scan_phase        = 'rotate'
+                self.scan_phase_frames = 0
+
+            # --- Détection uniquement pendant la pause (image stable) ---
+            if self.scan_phase == 'pause':
+                detections, self.debug_mask, _ = detect_gates(camera_data)
+
+                for det in detections:
+                    if det['has_4_corners']:
+                        self.best_area    = det['area']
+                        self.best_angle_h = det['angle_h']
+                        self.refine_shrink_count = 0
+                        self.state = 'refine'
+                        self.scan_frames = 0
+                        self.scan_phase = 'rotate'
+                        self.scan_phase_frames = 0
+                        print(f"[STATE] Gate détecté (pause) aire={det['area']:.0f} → refine")
+                        break
+
+                # Fallback timeout : accepter le plus gros contour même sans 4 coins
+                if self.state == 'scan_ccw' and self.scan_frames > SCAN_TIMEOUT and detections:
+                    det = detections[0]
                     self.best_area    = det['area']
                     self.best_angle_h = det['angle_h']
                     self.refine_shrink_count = 0
                     self.state = 'refine'
                     self.scan_frames = 0
-                    print(f"[STATE] 4 coins + noir droite (aire={det['area']:.0f}) → refine")
-                    break
+                    self.scan_phase = 'rotate'
+                    self.scan_phase_frames = 0
+                    print(f"[STATE] Timeout scan → refine fallback "
+                          f"aire={det['area']:.0f} ({det['corner_count']} coins)")
 
-            # Fallback : si on a cherché trop longtemps sans voir 4 coins, accepter
-            # le plus gros contour même s'il n'a pas exactement 4 coins (gate coupé,
-            # vu de biais, etc.)
-            SCAN_TIMEOUT = 400  # environ ~20 secondes à 50Hz
-            if self.state == 'scan_ccw' and self.scan_frames > SCAN_TIMEOUT and detections:
-                det = detections[0]  # le plus gros (détections triées par aire)
-                self.best_area    = det['area']
-                self.best_angle_h = det['angle_h']
-                self.refine_shrink_count = 0
-                self.state = 'refine'
-                self.scan_frames = 0
-                print(f"[STATE] Timeout scan ({self.scan_frames}f) → refine avec "
-                      f"contour aire={det['area']:.0f} ({det['corner_count']} coins)")
-
+            # --- Commande de mouvement ---
             if self.state == 'scan_ccw':
-                new_yaw = self._normalize_angle(yaw + 10 * dt)
-                return [pos[0], pos[1], CRUISE_ALT, new_yaw]
+                if self.scan_phase == 'rotate':
+                    new_yaw = self._normalize_angle(yaw + 10 * dt)
+                    return [pos[0], pos[1], CRUISE_ALT, new_yaw]
+                else:
+                    # Pause : rester immobile au yaw courant
+                    return [pos[0], pos[1], CRUISE_ALT, yaw]
 
         # =====================================================================
         # REFINE : tourner jusqu'à noir gauche aussi → estimer position du gate
@@ -797,7 +844,7 @@ class MyAssignment:
                     self.gate_rough_pos = np.array([gate_x, gate_y, gate_z])
 
                 # -- Assez proche pour une bonne idée du centroïde → enregistrer le gate et passer au-dessus --
-                CLOSE_THRESHOLD_H = 80
+                CLOSE_THRESHOLD_H = 100
                 if det['h'] > CLOSE_THRESHOLD_H or (det['dist_est'] and det['dist_est'] < 0.6): #si det[...] is not none and det['dist_est'] < 0.6
                     self.gate_positions.append(self.gate_rough_pos.copy()) # stocker la position du gate trouvé
                     self.current_gate_idx = len(self.gate_positions) # indice du gate courant (pour lap 2)
@@ -828,7 +875,7 @@ class MyAssignment:
             else:
                 # ---- Gate pas visible ----
                 self.lost_count += 1
-                MAX_LOST_FRAMES = 300
+                MAX_LOST_FRAMES = 500
 
                 if self.lost_count > MAX_LOST_FRAMES:
                     print(f"[STATE] Gate perdu ({self.lost_count} frames) → scan_ccw")
@@ -896,7 +943,7 @@ class MyAssignment:
 
             if detections:
                 # On voit encore du magenta → tourner CW pour s'en éloigner
-                new_yaw = self._normalize_angle(yaw - 15 * dt)
+                new_yaw = self._normalize_angle(yaw - 10 * dt)
                 return [pos[0], pos[1], CRUISE_ALT, new_yaw]
             else:
                 # Plus de magenta → le gate courant est derrière nous
@@ -931,7 +978,11 @@ class MyAssignment:
             if self.trajectory is None:
                 start_pos = np.array([pos[0], pos[1], CRUISE_ALT])
                 waypoints = self._build_lap2_waypoints_shrunk(
-                    self.gate_positions, start_pos
+                    self.gate_positions, start_pos,
+                    lateral_offset=0.07   # offset (m) vers la droite du gate.
+                                         # 0.0 = centroïde exact.
+                                         # Augmenter (ex: 0.05) si le drone
+                                         # coupe les virages par la gauche.
                 )
                 end_pos = start_pos.copy()   # retour au point de départ après 2 laps
                 self.trajectory = self._compute_trajectory(
