@@ -378,7 +378,7 @@ class MyAssignment:
         return pos, vel
 
     def _compute_trajectory(self, start_pos, waypoints, end_pos,
-                            avg_speed=3, gate_speed_factor=0.7):
+                            avg_speed=3, gate_speed_factor=0.6):
         """
         Calcule une trajectoire min-snap par morceaux entre start_pos, tous les
         waypoints (passages de gates), et end_pos.
