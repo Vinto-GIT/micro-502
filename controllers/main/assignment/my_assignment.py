@@ -494,7 +494,7 @@ class MyAssignment:
     # MODIFICATION : waypoint décalé à droite du gate pour compenser l'inertie
     # =========================================================================
     def _build_lap2_waypoints_shrunk(self, ordered_gates, start_pos,
-                                     lateral_offset=0.07):
+                                     lateral_offset=0.08):
         """
         Construit la liste des waypoints pour 2 tours à partir des gates ordonnés
         (liste de np.array([x, y, z])).
@@ -979,7 +979,7 @@ class MyAssignment:
                 start_pos = np.array([pos[0], pos[1], CRUISE_ALT])
                 waypoints = self._build_lap2_waypoints_shrunk(
                     self.gate_positions, start_pos,
-                    lateral_offset=0.07   # offset (m) vers la droite du gate.
+                    lateral_offset=0.08   # offset (m) vers la droite du gate.
                                          # 0.0 = centroïde exact.
                                          # Augmenter (ex: 0.05) si le drone
                                          # coupe les virages par la gauche.
