@@ -967,7 +967,14 @@ class MyAssignment:
                 dx_h = home[0] - pos[0]
                 dy_h = home[1] - pos[1]
                 dist_home = np.linalg.norm([dx_h, dy_h])
-                if dist_home < 0.4:
+                # Timeout : si on n'atteint pas le home en 10s, forcer le démarrage
+                # depuis la position courante. Evite de rester bloqué indéfiniment.
+                if not hasattr(self, '_lap2_home_timeout'):
+                    self._lap2_home_timeout = 0
+                self._lap2_home_timeout += 1
+                if dist_home < 0.4 or self._lap2_home_timeout > 500:
+                    if self._lap2_home_timeout > 500:
+                        print(f"[LAP2] Timeout retour home ({dist_home:.2f}m) → démarrage forcé")
                     self.lap2_started = True
                     print("[LAP2] Pad de décollage atteint → calcul trajectoire")
                 else:
@@ -992,6 +999,13 @@ class MyAssignment:
                                                # → traversée lente et précise
                 )
                 self.traj_start_time = sensor_data.get('t', 0.0)
+                print(f"[LAP2] Trajectoire calculée : {self.trajectory['total_time']:.1f}s, "
+                      f"{len(self.trajectory['polys'])} segments")
+                print(f"[LAP2] Gates utilisés : {[list(np.round(g[:2],2)) for g in self.gate_positions]}")
+                # Sécurité : si la trajectoire est dégénérée (trop courte),
+                # c'est que les positions de gates sont aberrantes.
+                if self.trajectory['total_time'] < 5.0:
+                    print("[LAP2] AVERTISSEMENT : trajectoire très courte, gates peut-être mal estimés")
                 # Plot de la trajectoire (une seule fois)
                 self._plot_trajectory(self.trajectory, self.gate_positions,
                                       waypoints, start_pos, end_pos,
