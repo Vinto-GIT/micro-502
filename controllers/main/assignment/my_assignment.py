@@ -681,7 +681,7 @@ class MyAssignment:
         if self.state == 'scan_ccw':
             SCAN_ROT_FRAMES   = 12   # frames de rotation (~0.24s à 50Hz) → ~20° par impulsion
             SCAN_PAUSE_FRAMES = 12   # frames d'arrêt pour laisser l'image se stabiliser
-            SCAN_TIMEOUT      = 400  # frames totales avant fallback (~8s à 50Hz)
+            SCAN_TIMEOUT      = 600  # frames totales avant fallback (~8s à 50Hz)
 
             self.scan_frames       += 1
             self.scan_phase_frames += 1
