@@ -821,7 +821,7 @@ class MyAssignment:
                 start_pos = np.array([pos[0], pos[1], CRUISE_ALT])
                 waypoints = self._build_lap2_waypoints_shrunk(
                     self.gate_positions, start_pos,
-                    lateral_offset=1
+                    lateral_offset=0.1
                 )
                 end_pos = start_pos.copy()
                 self.trajectory = self._compute_trajectory(
