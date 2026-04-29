@@ -35,10 +35,7 @@ GATE_OBJ_POINTS = np.array([[-_hw, -_hh, 0.0],   # TL
 HSV_LOWER_MAG1 = np.array([138,  20,  110])
 HSV_UPPER_MAG1 = np.array([158, 210, 255])
 
-# Aire minimale en pixels² — seul filtre de taille conservé.
-# Très bas pour détecter des gates lointains (petits), mais assez haut
-# pour ignorer les pixels isolés dus au bruit HSV.
-MIN_CONTOUR_AREA = 80
+MIN_CONTOUR_AREA = 400
 
 NUM_GATES = 5
 OVERFLY_ALT = 2.0          # altitude pour passer au-dessus du gate
@@ -85,10 +82,9 @@ def detect_gates(image):
 
     mask = cv2.inRange(hsv, HSV_LOWER_MAG1, HSV_UPPER_MAG1)
 
-    # Morphologie minimale : juste connecter les pixels proches du même blob.
-    # On n'utilise plus de kernel_open pour ne pas effacer les petits gates lointains.
-    # kernel_close petit pour relier les pixels d'un même gate sans déformer les contours.
-    kernel_close = np.ones((3, 3), np.uint8)
+    kernel_open  = np.ones((5,  5),  np.uint8)
+    kernel_close = np.ones((15, 15), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel_open)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -114,6 +110,30 @@ def detect_gates(image):
 
         angle_h = (cx - CAM_WIDTH / 2.0) * angle_per_pixel
         angle_v = (CAM_HEIGHT / 2.0 - cy) * (CAM_FOV_V / CAM_HEIGHT)
+
+        MIN_BBOX_SIZE = 10
+        if w < MIN_BBOX_SIZE or h < MIN_BBOX_SIZE:
+            continue
+
+        # Rejeter les contours très allongés (probablement du bruit ou des barres isolées
+        # d'un gate, pas le gate entier). Un gate vu même de biais garde un ratio raisonnable.
+        aspect_ratio = w / max(h, 1)
+        if aspect_ratio > 6.0 or aspect_ratio < 0.17:  # gate vu de biais → trapèze très large
+            continue
+
+        # Filtre noir à droite : s'assure que le gate détecté est isolé à sa droite
+        # (pas un morceau de gate collé à un autre). Seuil assoupli à 40% pour tolérer
+        # les scènes avec plusieurs gates proches les uns des autres.
+        BLACK_MARGIN = 10
+        right_edge = min(x + w + BLACK_MARGIN, mask.shape[1] - 1)
+        has_black_right = False
+        if right_edge > x + w:
+            right_strip = mask[y:y+h, x+w:right_edge]
+            white_ratio = np.sum(right_strip > 0) / right_strip.size
+            has_black_right = (white_ratio <= 0.4)
+
+        if not has_black_right:
+            continue
 
         # Estimation de distance via hauteur apparente
         # D = (hauteur_réelle * focale) / hauteur_pixels
@@ -399,7 +419,7 @@ class MyAssignment:
     # MODIFICATION : waypoint décalé à droite du gate pour compenser l'inertie
     # =========================================================================
     def _build_lap2_waypoints_shrunk(self, ordered_gates, start_pos,
-                                     lateral_offset=0.1):
+                                     lateral_offset=0.08):
         """
         Construit la liste des waypoints pour 2 tours à partir des gates ordonnés
         (liste de np.array([x, y, z])).
@@ -772,6 +792,10 @@ class MyAssignment:
             if dist < 0.3:
                 self._reset_for_next_gate()
                 if len(self.gate_positions) >= NUM_GATES:
+                    # Pas de retour au home, on démarre la trajectoire
+                    # directement depuis la position courante après le dernier gate.
+                    # Les gates sont dans l'ordre de détection (CCW), pas besoin de
+                    # réordonner.
                     self.lap2_gate_idx  = 0
                     self.lap2_lap_count = 0
                     self.trajectory     = None
@@ -821,13 +845,17 @@ class MyAssignment:
                 start_pos = np.array([pos[0], pos[1], CRUISE_ALT])
                 waypoints = self._build_lap2_waypoints_shrunk(
                     self.gate_positions, start_pos,
-                    lateral_offset=1
+                    lateral_offset=0.08   # offset (m) vers la droite du gate.
+                                          # 0.0 = centroïde exact.
+                                          # Augmenter si le drone coupe les virages
+                                          # par la gauche.
                 )
-                end_pos = start_pos.copy()
+                end_pos = start_pos.copy()   # retour au point de départ après 2 laps
                 self.trajectory = self._compute_trajectory(
                     start_pos, waypoints, end_pos,
-                    avg_speed=1.5,
-                    gate_speed_factor=0.6
+                    avg_speed=1.5,             # vitesse cruise (m/s) — à tuner
+                    gate_speed_factor=0.6      # 60% de avg_speed au centroïde des gates
+                                               # → traversée lente et précise
                 )
                 self.traj_start_time = sensor_data.get('t', 0.0)
                 print(f"[LAP2] Trajectoire calculée depuis pos={np.round(pos[:2],2)}, "
