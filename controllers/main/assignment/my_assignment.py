@@ -480,14 +480,32 @@ class MyAssignment:
     def _closest_detection_to_target(self, detections, pos, yaw):
         """
         Parmi toutes les détections, retourne celle dont la position estimée
-        est la plus proche de self.gate_rough_pos.
-        Si gate_rough_pos est None, retourne simplement la plus grande détection.
-        Rejette les détections à plus de 1.5m de la cible.
-        Préfère les valeurs PnP (pnp_dist / pnp_angle_h) quand disponibles.
-        """
-        if self.gate_rough_pos is None:
-            return detections[0] if detections else None
+        est la plus proche du drone ou de self.gate_rough_pos.
 
+        - Si gate_rough_pos est None : retourne la détection la plus proche
+          du drone en distance (pnp_dist > dist_est > fallback), sans critère
+          sur le nombre de coins.
+        - Si gate_rough_pos est défini : retourne la détection dont la position
+          estimée dans le repère monde est la plus proche de gate_rough_pos
+          (comportement original), avec un seuil de rejet à 1.5m.
+        """
+        if not detections:
+            return None
+
+        # --- Pas de gate tracké : plus proche du drone par distance estimée ---
+        if self.gate_rough_pos is None:
+            best_det  = None
+            best_dist = float('inf')
+            for d in detections:
+                # Priorité PnP, puis dist_est, puis fallback grand
+                dist_d = d['pnp_dist'] if d['pnp_dist'] is not None else \
+                         (d['dist_est'] if d['dist_est'] is not None else float('inf'))
+                if dist_d < best_dist:
+                    best_dist = dist_d
+                    best_det  = d
+            return best_det
+
+        # --- Gate tracké : plus proche de gate_rough_pos dans le repère monde ---
         best_det  = None
         best_dist = float('inf')
         for d in detections:
@@ -676,9 +694,9 @@ class MyAssignment:
         # =====================================================================
         # APPROACH : servo visuel continu
         #   - Centrer le gate + avancer avec mise à jour continue du centroïde
-        #   - Focus sur le gate tracké : on ignore les détections trop loin de
-        #     gate_rough_pos (autres gates visibles en même temps)
-        #   - Quand assez proche → enregistrer la position et passer à overfly
+        #   - Si plusieurs gates visibles, cibler le plus proche du drone
+        #     (critère distance PnP/dist_est), pas le gate avec 4 coins
+        #   - Quand assez proche → enregistrer la position et passer à fly_through
         #   - Toutes les estimations de position utilisent PnP en priorité
         # =====================================================================
         if self.state == 'approach':
