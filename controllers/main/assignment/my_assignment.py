@@ -35,7 +35,7 @@ GATE_OBJ_POINTS = np.array([[-_hw, -_hh, 0.0],   # TL
 HSV_LOWER_MAG1 = np.array([138,  20,  110])
 HSV_UPPER_MAG1 = np.array([158, 210, 255])
 
-MIN_CONTOUR_AREA = 400
+MIN_CONTOUR_AREA = 80
 
 NUM_GATES = 5
 OVERFLY_ALT = 2.0          # altitude pour passer au-dessus du gate
@@ -400,7 +400,7 @@ class MyAssignment:
     # MODIFICATION : waypoint décalé à droite du gate pour compenser l'inertie
     # =========================================================================
     def _build_lap2_waypoints_shrunk(self, ordered_gates, start_pos,
-                                     lateral_offset=0.08):
+                                     lateral_offset=0.15):
         """
         Construit la liste des waypoints pour 2 tours à partir des gates ordonnés
         (liste de np.array([x, y, z])).
@@ -883,9 +883,18 @@ class MyAssignment:
                 start_pos = np.array([pos[0], pos[1], CRUISE_ALT])
                 waypoints = self._build_lap2_waypoints_shrunk(
                     self.gate_positions, start_pos,
-                    lateral_offset=0.08
+                    lateral_offset=0.15
                 )
-                end_pos = start_pos.copy()
+                # end_pos = 1m après le dernier gate (lap 2) dans sa direction
+                # de traversée, pour être sûr de le passer complètement.
+                last_gate = self.gate_positions[-1]
+                last_wp   = waypoints[-1]   # dernier waypoint = dernier gate lap 2
+                last_n    = last_wp['normal']
+                end_pos   = np.array([
+                    last_gate[0] + 1.0 * last_n[0],
+                    last_gate[1] + 1.0 * last_n[1],
+                    CRUISE_ALT
+                ])
                 self.trajectory = self._compute_trajectory(
                     start_pos, waypoints, end_pos,
                     avg_speed=1.5,
