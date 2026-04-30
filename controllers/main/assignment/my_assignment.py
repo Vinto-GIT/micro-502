@@ -82,9 +82,9 @@ def detect_gates(image):
 
     mask = cv2.inRange(hsv, HSV_LOWER_MAG1, HSV_UPPER_MAG1)
 
-    kernel_open  = np.ones((5,  5),  np.uint8)
-    kernel_close = np.ones((15, 15), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel_open)
+    # Fermeture minimale uniquement — pas de kernel_open pour ne pas
+    # effacer les petits gates lointains.
+    kernel_close = np.ones((3, 3), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -110,30 +110,6 @@ def detect_gates(image):
 
         angle_h = (cx - CAM_WIDTH / 2.0) * angle_per_pixel
         angle_v = (CAM_HEIGHT / 2.0 - cy) * (CAM_FOV_V / CAM_HEIGHT)
-
-        MIN_BBOX_SIZE = 10
-        if w < MIN_BBOX_SIZE or h < MIN_BBOX_SIZE:
-            continue
-
-        # Rejeter les contours très allongés (probablement du bruit ou des barres isolées
-        # d'un gate, pas le gate entier). Un gate vu même de biais garde un ratio raisonnable.
-        aspect_ratio = w / max(h, 1)
-        if aspect_ratio > 3.0 or aspect_ratio < 0.33:
-            continue
-
-        # Filtre noir à droite : s'assure que le gate détecté est isolé à sa droite
-        # (pas un morceau de gate collé à un autre). Seuil assoupli à 40% pour tolérer
-        # les scènes avec plusieurs gates proches les uns des autres.
-        BLACK_MARGIN = 10
-        right_edge = min(x + w + BLACK_MARGIN, mask.shape[1] - 1)
-        has_black_right = False
-        if right_edge > x + w:
-            right_strip = mask[y:y+h, x+w:right_edge]
-            white_ratio = np.sum(right_strip > 0) / right_strip.size
-            has_black_right = (white_ratio <= 0.4)
-
-        if not has_black_right:
-            continue
 
         # Estimation de distance via hauteur apparente
         # D = (hauteur_réelle * focale) / hauteur_pixels
