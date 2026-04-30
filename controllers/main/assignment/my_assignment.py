@@ -35,10 +35,7 @@ GATE_OBJ_POINTS = np.array([[-_hw, -_hh, 0.0],   # TL
 HSV_LOWER_MAG1 = np.array([138,  20,  110])
 HSV_UPPER_MAG1 = np.array([158, 210, 255])
 
-# Aire minimale en pixels² — seul filtre de taille conservé.
-# Très bas pour détecter des gates lointains (petits), mais assez haut
-# pour ignorer les pixels isolés dus au bruit HSV.
-MIN_CONTOUR_AREA = 80
+MIN_CONTOUR_AREA = 400
 
 NUM_GATES = 5
 OVERFLY_ALT = 2.0          # altitude pour passer au-dessus du gate
@@ -85,10 +82,9 @@ def detect_gates(image):
 
     mask = cv2.inRange(hsv, HSV_LOWER_MAG1, HSV_UPPER_MAG1)
 
-    # Morphologie minimale : juste connecter les pixels proches du même blob.
-    # On n'utilise plus de kernel_open pour ne pas effacer les petits gates lointains.
-    # kernel_close petit pour relier les pixels d'un même gate sans déformer les contours.
-    kernel_close = np.ones((3, 3), np.uint8)
+    kernel_open  = np.ones((5,  5),  np.uint8)
+    kernel_close = np.ones((15, 15), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel_open)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -114,6 +110,30 @@ def detect_gates(image):
 
         angle_h = (cx - CAM_WIDTH / 2.0) * angle_per_pixel
         angle_v = (CAM_HEIGHT / 2.0 - cy) * (CAM_FOV_V / CAM_HEIGHT)
+
+        MIN_BBOX_SIZE = 10
+        if w < MIN_BBOX_SIZE or h < MIN_BBOX_SIZE:
+            continue
+
+        # Rejeter les contours très allongés (probablement du bruit ou des barres isolées
+        # d'un gate, pas le gate entier). Un gate vu même de biais garde un ratio raisonnable.
+        aspect_ratio = w / max(h, 1)
+        if aspect_ratio > 3.0 or aspect_ratio < 0.33:
+            continue
+
+        # Filtre noir à droite : s'assure que le gate détecté est isolé à sa droite
+        # (pas un morceau de gate collé à un autre). Seuil assoupli à 40% pour tolérer
+        # les scènes avec plusieurs gates proches les uns des autres.
+        BLACK_MARGIN = 10
+        right_edge = min(x + w + BLACK_MARGIN, mask.shape[1] - 1)
+        has_black_right = False
+        if right_edge > x + w:
+            right_strip = mask[y:y+h, x+w:right_edge]
+            white_ratio = np.sum(right_strip > 0) / right_strip.size
+            has_black_right = (white_ratio <= 0.4)
+
+        if not has_black_right:
+            continue
 
         # Estimation de distance via hauteur apparente
         # D = (hauteur_réelle * focale) / hauteur_pixels
@@ -213,6 +233,9 @@ class MyAssignment:
         self.scan_phase        = 'rotate'   # 'rotate' ou 'pause'
         self.scan_phase_frames = 0          # frames écoulées dans la phase courante
 
+        self.scan_start_yaw    = None
+        self.scan_advance_done = False
+
         # Position estimée du gate courant (lissée)
         self.gate_rough_pos  = None
         self.lost_count      = 0
@@ -245,6 +268,8 @@ class MyAssignment:
         self.scan_frames = 0
         self.scan_phase = 'rotate'
         self.scan_phase_frames = 0
+        self.scan_start_yaw = None
+        self.scan_advance_done = False
 
     def _estimate_gate_normal(self, gate_pos, prev_pos, next_pos):
         """
@@ -399,7 +424,7 @@ class MyAssignment:
     # MODIFICATION : waypoint décalé à droite du gate pour compenser l'inertie
     # =========================================================================
     def _build_lap2_waypoints_shrunk(self, ordered_gates, start_pos,
-                                     lateral_offset=0.1):
+                                     lateral_offset=0.08):
         """
         Construit la liste des waypoints pour 2 tours à partir des gates ordonnés
         (liste de np.array([x, y, z])).
@@ -479,48 +504,46 @@ class MyAssignment:
 
     def _closest_detection_to_target(self, detections, pos, yaw):
         """
-        Parmi toutes les détections, retourne celle dont la position estimée
-        est la plus proche du drone ou de self.gate_rough_pos.
+        Retourne la détection la plus pertinente parmi toutes les détections.
 
-        - Si gate_rough_pos est None : retourne la détection la plus proche
-          du drone en distance (pnp_dist > dist_est > fallback), sans critère
-          sur le nombre de coins.
-        - Si gate_rough_pos est défini : retourne la détection dont la position
-          estimée dans le repère monde est la plus proche de gate_rough_pos
-          (comportement original), avec un seuil de rejet à 1.5m.
+        Deux cas :
+        1. gate_rough_pos connu → retourne le blob dont la position estimée
+           est la plus proche de gate_rough_pos. Rejette si > 1.5m.
+        2. gate_rough_pos inconnu (None, premier gate) → retourne le blob
+           le plus PROCHE en distance estimée (pnp_dist ou dist_est).
+           On va vers la gate la plus proche, pas la plus grande.
+
+        Préfère toujours les valeurs PnP quand disponibles.
         """
         if not detections:
             return None
 
-        # --- Pas de gate tracké : plus proche du drone par distance estimée ---
         if self.gate_rough_pos is None:
-            best_det  = None
-            best_dist = float('inf')
-            for d in detections:
-                # Priorité PnP, puis dist_est, puis fallback grand
-                dist_d = d['pnp_dist'] if d['pnp_dist'] is not None else \
-                         (d['dist_est'] if d['dist_est'] is not None else float('inf'))
-                if dist_d < best_dist:
-                    best_dist = dist_d
-                    best_det  = d
-            return best_det
+            # Cas 1 : position inconnue → prendre le plus proche en distance
+            def get_dist(d):
+                if d['pnp_dist'] is not None:
+                    return d['pnp_dist']
+                if d['dist_est'] is not None:
+                    return d['dist_est']
+                return float('inf')  # pas d'estimation → déprioritiser
+            return min(detections, key=get_dist)
 
-        # --- Gate tracké : plus proche de gate_rough_pos dans le repère monde ---
+        # Cas 2 : position connue → prendre le plus proche de gate_rough_pos
         best_det  = None
         best_dist = float('inf')
         for d in detections:
-            dist_d   = d['pnp_dist']    if d['pnp_dist']    is not None else \
-                       (d['dist_est']   if d['dist_est']     else 2.0)
-            angle_h  = d['pnp_angle_h'] if d['pnp_angle_h'] is not None else d['angle_h']
-            gate_dir = yaw - angle_h
-            gx = pos[0] + dist_d * np.cos(gate_dir)
-            gy = pos[1] + dist_d * np.sin(gate_dir)
+            dist_d  = d['pnp_dist']    if d['pnp_dist']    is not None else \
+                      (d['dist_est']   if d['dist_est']     else 2.0)
+            angle_h = d['pnp_angle_h'] if d['pnp_angle_h'] is not None else d['angle_h']
+            gx = pos[0] + dist_d * np.cos(yaw - angle_h)
+            gy = pos[1] + dist_d * np.sin(yaw - angle_h)
             dist_to_tracked = np.linalg.norm([gx - self.gate_rough_pos[0],
                                               gy - self.gate_rough_pos[1]])
             if dist_to_tracked < best_dist:
                 best_dist = dist_to_tracked
                 best_det  = d
 
+        # Seuil : si trop loin de la cible → considérer comme gate différent
         return best_det if best_dist < 1.5 else None
 
     def compute_command(self, sensor_data, camera_data, dt):
@@ -570,9 +593,28 @@ class MyAssignment:
             SCAN_ROT_FRAMES   = 12    # frames de rotation (~0.24s à 50Hz) → ~20° par impulsion
             SCAN_PAUSE_FRAMES = 12    # frames d'arrêt pour laisser l'image se stabiliser
             SCAN_TIMEOUT      = 600   # frames totales avant fallback
+            SCAN_ADVANCE_DEG  = 80.0
+            SCAN_ADVANCE_DIST = 0.5
+            SCAN_ADVANCE_FRAMES = 20
+
+            if self.scan_start_yaw is None:
+                self.scan_start_yaw = yaw
 
             self.scan_frames       += 1
             self.scan_phase_frames += 1
+
+            # --- Phase d'avance ---
+            if self.scan_advance_done:
+                if self.scan_phase_frames >= SCAN_ADVANCE_FRAMES:
+                    self.scan_advance_done = False
+                    self.scan_start_yaw    = yaw
+                    self.scan_phase        = 'rotate'
+                    self.scan_phase_frames = 0
+                    print(f"[SCAN] Avance terminée → reprise scan")
+                else:
+                    fwd_x = pos[0] + SCAN_ADVANCE_DIST / SCAN_ADVANCE_FRAMES * np.cos(yaw)
+                    fwd_y = pos[1] + SCAN_ADVANCE_DIST / SCAN_ADVANCE_FRAMES * np.sin(yaw)
+                    return [fwd_x, fwd_y, CRUISE_ALT, yaw]
 
             # --- Transition entre phases rotate/pause ---
             if self.scan_phase == 'rotate' and self.scan_phase_frames >= SCAN_ROT_FRAMES:
@@ -582,25 +624,26 @@ class MyAssignment:
                 self.scan_phase        = 'rotate'
                 self.scan_phase_frames = 0
 
+            # --- Vérifier l'angle parcouru ---
+            angle_turned = abs(self._angle_diff(yaw, self.scan_start_yaw))
+            if angle_turned >= np.radians(SCAN_ADVANCE_DEG):
+                self.scan_advance_done = True
+                self.scan_phase_frames = 0
+                print(f"[SCAN] {SCAN_ADVANCE_DEG}° sans détection → avance de {SCAN_ADVANCE_DIST}m")
+                fwd_x = pos[0] + SCAN_ADVANCE_DIST / SCAN_ADVANCE_FRAMES * np.cos(yaw)
+                fwd_y = pos[1] + SCAN_ADVANCE_DIST / SCAN_ADVANCE_FRAMES * np.sin(yaw)
+                return [fwd_x, fwd_y, CRUISE_ALT, yaw]
+
             # --- Détection uniquement pendant la pause (image stable) ---
             if self.scan_phase == 'pause':
                 detections, self.debug_mask, _ = detect_gates(camera_data)
 
-                for det in detections:
-                    if det['has_4_corners']:
-                        self.best_area    = det['area']
-                        self.best_angle_h = det['angle_h']
-                        self.refine_shrink_count = 0
-                        self.state = 'refine'
-                        self.scan_frames = 0
-                        self.scan_phase = 'rotate'
-                        self.scan_phase_frames = 0
-                        print(f"[STATE] Gate détecté (pause) aire={det['area']:.0f} → refine")
-                        break
-
-                # Fallback timeout : accepter le plus gros contour même sans 4 coins
-                if self.state == 'scan_ccw' and self.scan_frames > SCAN_TIMEOUT and detections:
-                    det = detections[0]
+                # Parmi les blobs avec 4 coins, prendre le plus proche
+                candidates_4 = [d for d in detections if d['has_4_corners']]
+                if candidates_4:
+                    det = min(candidates_4, key=lambda d:
+                              d['pnp_dist'] if d['pnp_dist'] is not None else
+                              (d['dist_est'] if d['dist_est'] is not None else float('inf')))
                     self.best_area    = det['area']
                     self.best_angle_h = det['angle_h']
                     self.refine_shrink_count = 0
@@ -608,8 +651,28 @@ class MyAssignment:
                     self.scan_frames = 0
                     self.scan_phase = 'rotate'
                     self.scan_phase_frames = 0
+                    self.scan_start_yaw = None
+                    self.scan_advance_done = False
+                    print(f"[STATE] Gate détecté (pause) dist="
+                          f"{det['pnp_dist'] or det['dist_est']:.2f}m → refine")
+
+                # Fallback timeout : plus proche contour même sans 4 coins
+                if self.state == 'scan_ccw' and self.scan_frames > SCAN_TIMEOUT and detections:
+                    det = min(detections, key=lambda d:
+                              d['pnp_dist'] if d['pnp_dist'] is not None else
+                              (d['dist_est'] if d['dist_est'] is not None else float('inf')))
+                    self.best_area    = det['area']
+                    self.best_angle_h = det['angle_h']
+                    self.refine_shrink_count = 0
+                    self.state = 'refine'
+                    self.scan_frames = 0
+                    self.scan_phase = 'rotate'
+                    self.scan_phase_frames = 0
+                    self.scan_start_yaw = None
+                    self.scan_advance_done = False
                     print(f"[STATE] Timeout scan → refine fallback "
-                          f"aire={det['area']:.0f} ({det['corner_count']} coins)")
+                          f"dist={det['pnp_dist'] or det['dist_est']} "
+                          f"({det['corner_count']} coins)")
 
             # --- Commande de mouvement ---
             if self.state == 'scan_ccw':
@@ -669,7 +732,10 @@ class MyAssignment:
             # noirs, on accepte quand même avec le plus gros contour visible
             REFINE_TIMEOUT = 200
             if self.state == 'refine' and self.scan_frames > REFINE_TIMEOUT and detections:
-                det = detections[0]
+                # Fallback : plus proche blob visible
+                det = min(detections, key=lambda d:
+                          d['pnp_dist'] if d['pnp_dist'] is not None else
+                          (d['dist_est'] if d['dist_est'] is not None else float('inf')))
                 dist         = det['pnp_dist']    if det['pnp_dist']    is not None else \
                                (det['dist_est']   if det['dist_est']    else 2.0)
                 angle_h_used = det['pnp_angle_h'] if det['pnp_angle_h'] is not None else det['angle_h']
@@ -694,9 +760,9 @@ class MyAssignment:
         # =====================================================================
         # APPROACH : servo visuel continu
         #   - Centrer le gate + avancer avec mise à jour continue du centroïde
-        #   - Si plusieurs gates visibles, cibler le plus proche du drone
-        #     (critère distance PnP/dist_est), pas le gate avec 4 coins
-        #   - Quand assez proche → enregistrer la position et passer à fly_through
+        #   - Focus sur le gate tracké : on ignore les détections trop loin de
+        #     gate_rough_pos (autres gates visibles en même temps)
+        #   - Quand assez proche → enregistrer la position et passer à overfly
         #   - Toutes les estimations de position utilisent PnP en priorité
         # =====================================================================
         if self.state == 'approach':
@@ -742,7 +808,8 @@ class MyAssignment:
                     self.fly_through_yaw = approach_dir
                     print(f"[STATE] Gate {len(self.gate_positions)}/{NUM_GATES} "
                           f"enregistré à {self.gate_rough_pos} → fly_through")
-                    print(f"[MONITOR] GATE_DETECTED={len(self.gate_positions)} pos={np.round(self.gate_rough_pos,2).tolist()}")
+                    print(f"[MONITOR] GATE_DETECTED={len(self.gate_positions)} "
+                          f"pos={np.round(self.gate_rough_pos,2).tolist()}")
                     self.state = 'fly_through'
                     return [pos[0], pos[1], through_z, yaw]
 
@@ -760,7 +827,8 @@ class MyAssignment:
 
                 if self.lost_count > MAX_LOST_FRAMES:
                     print(f"[STATE] Gate perdu ({self.lost_count} frames) → scan_ccw")
-                    print(f"[MONITOR] GATE_LOST at_gate={len(self.gate_positions)+1} pos={np.round(pos,2).tolist()}")
+                    print(f"[MONITOR] GATE_LOST at_gate={len(self.gate_positions)+1} "
+                          f"pos={np.round(pos,2).tolist()}")
                     self.state = 'scan_ccw'
                     self.lost_count = 0
                     return [pos[0], pos[1], CRUISE_ALT, yaw]
@@ -839,7 +907,7 @@ class MyAssignment:
                 start_pos = np.array([pos[0], pos[1], CRUISE_ALT])
                 waypoints = self._build_lap2_waypoints_shrunk(
                     self.gate_positions, start_pos,
-                    lateral_offset=0.1
+                    lateral_offset=0.08
                 )
                 end_pos = start_pos.copy()
                 self.trajectory = self._compute_trajectory(
@@ -850,7 +918,8 @@ class MyAssignment:
                 self.traj_start_time = sensor_data.get('t', 0.0)
                 print(f"[LAP2] Trajectoire calculée depuis pos={np.round(pos[:2],2)}, "
                       f"total={self.trajectory['total_time']:.1f}s")
-                print(f"[MONITOR] LAP2_START t={sensor_data.get('t',0.0):.2f} gates={[list(np.round(g,2)) for g in self.gate_positions]}")
+                print(f"[MONITOR] LAP2_START t={sensor_data.get('t',0.0):.2f} "
+                      f"gates={[list(np.round(g,2)) for g in self.gate_positions]}")
                 self._plot_trajectory(self.trajectory, self.gate_positions,
                                       waypoints, start_pos, end_pos,
                                       filename='lap2_trajectory.png')
@@ -861,7 +930,8 @@ class MyAssignment:
 
             if t_local >= self.trajectory['total_time']:
                 print("[STATE] Trajectoire min-snap terminée → finished")
-                print(f"[MONITOR] LAP2_END t={sensor_data.get('t',0.0):.2f} duration={t_local:.2f}")
+                print(f"[MONITOR] LAP2_END t={sensor_data.get('t',0.0):.2f} "
+                      f"duration={t_local:.2f}")
                 self.state = 'finished'
                 return [pos[0], pos[1], CRUISE_ALT, yaw]
 
