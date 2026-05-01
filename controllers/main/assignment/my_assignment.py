@@ -32,7 +32,7 @@ GATE_OBJ_POINTS = np.array([[-_hw, -_hh, 0.0],
 HSV_LOWER_MAG1 = np.array([138,  20, 110])
 HSV_UPPER_MAG1 = np.array([158, 210, 255])
 
-MIN_CONTOUR_AREA = 80   # seul filtre de taille — élimine uniquement le bruit HSV isolé
+MIN_CONTOUR_AREA = 20   # seul filtre de taille — élimine uniquement le bruit HSV isolé
 
 NUM_GATES   = 5
 CRUISE_ALT  = 1.5
