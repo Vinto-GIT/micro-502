@@ -32,7 +32,7 @@ GATE_OBJ_POINTS = np.array([[-_hw, -_hh, 0.0],
 HSV_LOWER_MAG1 = np.array([138,  20, 110])
 HSV_UPPER_MAG1 = np.array([158, 210, 255])
 
-MIN_CONTOUR_AREA = 20   # seul filtre de taille — élimine uniquement le bruit HSV isolé
+MIN_CONTOUR_AREA = 80   # seul filtre de taille — élimine uniquement le bruit HSV isolé
 
 NUM_GATES   = 5
 CRUISE_ALT  = 1.5
@@ -553,12 +553,30 @@ class MyAssignment:
                     self.state = 'fly_through'
                     return [pos[0], pos[1], through_z, yaw]
 
-                # Centrer + avancer
                 APPROACH_SPEED = 0.35
-                return [pos[0] + APPROACH_SPEED * np.cos(gate_dir),
-                        pos[1] + APPROACH_SPEED * np.sin(gate_dir),
+                LATERAL_SPEED  = 0.20  # m/s de décalage latéral
+
+                # Si gate proche ET aire petite → gate vue de biais (perpendiculaire).
+                # Se décaler latéralement pour avoir une forme ~carrée dans l'image.
+                # Signe : aller dans le sens qui réduit |angle_h| (ramène le gate
+                # vers le centre).
+                DIST_BIAIS  = 2.0   # m  : en dessous = "proche"
+                AREA_BIAIS  = 400   # px²: en dessous = "petit" (de biais)
+
+                fwd_x = APPROACH_SPEED * np.cos(gate_dir)
+                fwd_y = APPROACH_SPEED * np.sin(gate_dir)
+
+                lat_x, lat_y = 0.0, 0.0
+                if dist < DIST_BIAIS and det['area'] < AREA_BIAIS:
+                    sign  = 1.0 if angle_h_used > 0 else -1.0
+                    lat_x = sign * LATERAL_SPEED * np.sin(gate_dir)
+                    lat_y = sign * LATERAL_SPEED * (-np.cos(gate_dir))
+
+                target_yaw = self._normalize_angle(yaw - angle_h_used)
+                return [pos[0] + fwd_x + lat_x,
+                        pos[1] + fwd_y + lat_y,
                         float(self.gate_rough_pos[2]),
-                        self._normalize_angle(yaw - angle_h_used)]
+                        target_yaw]
 
             else:
                 self.lost_count += 1
