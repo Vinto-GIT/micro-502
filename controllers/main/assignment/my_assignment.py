@@ -258,7 +258,7 @@ class MyAssignment:
                 np.einsum('k,kd->d', dt_pow, coeffs))
 
     def _compute_trajectory(self, start_pos, waypoints, end_pos,
-                            avg_speed=1.5, gate_speed_factor=0.6):
+                            avg_speed=1.2, gate_speed_factor=0.6):
         """
         Trajectoire min-snap par morceaux.
         Durées : d / avg_speed, clippé entre 0.3s et 5s.
@@ -404,7 +404,7 @@ class MyAssignment:
         # Fallback après SCAN_TIMEOUT : accepter même sans 4 coins.
         # =====================================================================
         if self.state == 'scan_ccw':
-            SCAN_ROT_FRAMES   = 12    # ~0.24s à 50Hz → ~20° par impulsion
+            SCAN_ROT_FRAMES   = 6    # ~0.24s à 50Hz → ~20° par impulsion
             SCAN_PAUSE_FRAMES = 12    # pause pour stabiliser l'image
             SCAN_TIMEOUT      = 600   # fallback après ~12s sans détection
 
@@ -658,7 +658,7 @@ class MyAssignment:
 
                 self.trajectory = self._compute_trajectory(
                     start_pos, waypoints, end_pos,
-                    avg_speed=1.5,        # vitesse cruise (m/s) — monter pour aller + vite
+                    avg_speed=1.2,        # vitesse cruise (m/s) — monter pour aller + vite
                     gate_speed_factor=0.6 # 60% de avg_speed au centroïde des gates
                 )
                 self.traj_start_time = sensor_data.get('t', 0.0)
