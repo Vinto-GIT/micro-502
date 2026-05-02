@@ -40,3 +40,9 @@ run_id,timestamp,world,run_start_t,gates_detected,gate_positions,gates_lost_coun
 18,2026-04-29T23:31:36,crazyflie_world_assignment.wbt,0.01,5,"[2.51, 1.29, 0.8] | [5.65, 1.9, 0.89] | [6.24, 3.9, 1.48] | [4.54, 5.67, 1.15] | [2.34, 6.61, 1.45]",0,52.3,74.24,21.94,True,True,False,
 19,2026-04-29T23:34:06,crazyflie_world_assignment.wbt,0.02,5,"[2.03, 1.77, 0.65] | [4.98, 2.27, 1.3] | [7.09, 3.37, 0.91] | [4.61, 5.72, 1.15] | [3.07, 6.41, 1.49]",0,69.05,90.66,21.62,True,True,False,
 20,2026-04-29T23:37:10,crazyflie_world_assignment.wbt,0.02,5,"[2.41, 2.18, 0.97] | [4.61, 2.57, 1.65] | [5.66, 3.62, 1.59] | [4.81, 5.36, 1.18] | [2.27, 6.26, 1.69]",0,51.94,69.94,18.0,True,True,False,
+1,2026-05-02T10:19:32,crazyflie_world_assignment.wbt,0.02,1,"[3.32, 2.44, 1.71]",1,,,,False,False,False,gate_lost_at=2
+2,2026-05-02T10:19:58,crazyflie_world_assignment.wbt,0.02,0,,0,,,,False,False,False,
+3,2026-05-02T10:20:05,crazyflie_world_assignment.wbt,,0,,0,,,,False,False,False,interrupted
+1,2026-05-02T10:23:22,crazyflie_world_assignment.wbt,0.02,5,"[3.31, 2.05, 0.89] | [4.86, 2.11, 1.0] | [6.7, 4.12, 1.4] | [4.79, 5.56, 0.98] | [3.35, 5.57, 1.66]",0,54.02,71.57,17.55,True,True,False,
+2,2026-05-02T10:24:47,crazyflie_world_assignment.wbt,0.01,5,"[2.71, 1.09, 1.2] | [5.65, 2.03, 0.82] | [7.35, 3.59, 2.12] | [2.11, 1.67, 1.76] | [5.32, 2.45, 0.85] | [7.04, 4.48, 1.58] | [6.02, 6.17, 0.69] | [3.4, 6.14, 1.77]",0,56.86,79.57,22.7,True,True,False,
+3,2026-05-02T10:27:55,crazyflie_world_assignment.wbt,0.01,2,"[2.98, 2.92, 1.73] | [6.48, 4.61, 1.76]",0,,,,False,False,False,interrupted

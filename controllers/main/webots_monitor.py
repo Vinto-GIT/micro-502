@@ -195,7 +195,7 @@ def launch_webots(webots_bin, world_path):
     cmd = [
         webots_bin,
         '--batch',          # pas d'interface de confirmation
-        '--mode=fast',      # vitesse max
+        '--mode=realtime',      # vitesse max
         '--stdout',         # rediriger stdout du contrôleur
         '--stderr',         # rediriger stderr du contrôleur
         world_path,
