@@ -32,7 +32,10 @@ GATE_OBJ_POINTS = np.array([[-_hw, -_hh, 0.0],
 HSV_LOWER_MAG1 = np.array([138,  20, 110])
 HSV_UPPER_MAG1 = np.array([158, 210, 255])
 
-MIN_CONTOUR_AREA = 20   # seul filtre de taille — élimine uniquement le bruit HSV isolé
+# Seuil bas (avant 20) pour capter aussi les gates vues quasi de profil :
+# leurs blobs sont fins/petits mais doivent encore déclencher la chaîne
+# refine→approach→manœuvre perp pour qu'on ait une chance de les approcher.
+MIN_CONTOUR_AREA = 10
 
 NUM_GATES   = 5
 CRUISE_ALT  = 1.5
@@ -41,11 +44,12 @@ CIRCUIT_CENTER = np.array([4.0, 4.0])
 
 # =============================================================================
 # VITESSES DE ROTATION (rad/s, multipliées par dt)
-# Réduites pour la simulation x1 (vs x0.5 avant) — moins d'inertie résiduelle,
-# images plus stables, détection plus fiable.
+# Encore réduites par rapport à la version précédente : on a > 60s de marge
+# sur les 240s du run, donc on privilégie la robustesse aux gates
+# perpendiculaires/lointaines plutôt que la vitesse pure.
 # =============================================================================
-YAW_RATE_SCAN   = 4.0   # rad/s — scan_ccw rotate (avant : 10)
-YAW_RATE_REFINE = 4.0   # rad/s — refine
+YAW_RATE_SCAN   = 2.0   # rad/s — scan_ccw rotate (avant 4.0) — pas plus petits par cycle
+YAW_RATE_REFINE = 2.5   # rad/s — refine     (avant 4.0) — moins de risque de dépasser le centre
 YAW_RATE_CLEAR  = 6.0   # rad/s — scan_clear (CW pour s'éloigner du gate passé)
 
 
@@ -173,19 +177,33 @@ class MyAssignment:
         self.scan_just_entered  = True
         self.scan_settle_frames = 0
 
+        # Drift latéral : si scan_ccw fait un tour complet sans rien détecter,
+        # on déplace le drone à gauche (0.4m) puis à droite (0.4m) pour
+        # changer l'angle de vue. C'est ce qui sauve les gates perpendiculaires
+        # à la sortie d'une autre gate : depuis la position d'arrivée, elles
+        # sont vues quasi de profil et leur blob est trop fin pour être
+        # détectable de façon stable. Un déport latéral révèle leur face.
+        self.scan_origin_pos     = None    # position au début du scan (centre du drift)
+        self.scan_origin_yaw     = 0.0     # yaw au début du scan (référence latérale)
+        self.scan_total_rotation = 0.0     # rad CCW accumulés depuis le dernier reset
+        self.scan_yaw_prev       = 0.0     # yaw frame précédente (pour calcul delta)
+        self.scan_lateral_phase  = 0       # 0=centre, 1=gauche, 2=droite
+
         # Position estimée du gate courant (lissée exponentiellement)
         self.gate_rough_pos = None
         self.lost_count     = 0
         self.last_good_yaw  = None
 
-        # Manœuvre "gate perpendiculaire" : déplacement déterministe de 3s
-        # vers la droite et un peu en face de la gate, avec yaw figé.
-        # Une seule manœuvre par gate (perp_done) — sinon on saute en boucle.
+        # Manœuvre "gate perpendiculaire" : déplacement déterministe (~5s)
+        # vers la droite (1ère tentative) puis la gauche (2ème tentative)
+        # de la gate, avec yaw figé pointant vers la gate. Si les deux essais
+        # ne révèlent pas la gate, on retombe sur l'approche normale avec
+        # l'estimation de position courante.
         self.perp_active        = False
         self.perp_frames        = 0
         self.perp_target        = None    # np.array(3) : point cible (figé)
         self.perp_lock_dir      = None    # rad : yaw figé vers la gate
-        self.perp_done          = False   # True après 1 manœuvre → ne plus déclencher
+        self.perp_attempts      = 0       # 0=aucune, 1=droite faite, 2=gauche faite, 99=bloqué
 
         # Gates détectés en lap1
         self.gate_positions   = []
@@ -213,11 +231,17 @@ class MyAssignment:
         self.scan_phase_frames    = 0
         self.scan_just_entered    = True
         self.scan_settle_frames   = 0
+        # Reset du drift latéral : on recommence le scan complet pour le gate suivant
+        self.scan_origin_pos      = None
+        self.scan_origin_yaw      = 0.0
+        self.scan_total_rotation  = 0.0
+        self.scan_yaw_prev        = 0.0
+        self.scan_lateral_phase   = 0
         self.perp_active          = False
         self.perp_frames          = 0
         self.perp_target          = None
         self.perp_lock_dir        = None
-        self.perp_done            = False
+        self.perp_attempts        = 0
 
     def _closest_detection_to_target(self, detections, pos, yaw):
         if not detections:
@@ -400,21 +424,37 @@ class MyAssignment:
             return [pos[0], pos[1], CRUISE_ALT, self.yaw_90_target]
 
         # =====================================================================
-        # SCAN_CCW : rotation CCW stop-and-detect (LENT pour x1)
+        # SCAN_CCW : rotation CCW stop-and-detect + drift latéral en fallback
         #
         # Étape 0 : stabilisation (SCAN_SETTLE_FRAMES) à l'entrée pour absorber
         #           l'inertie résiduelle de scan_clear (qui tournait CW).
-        # Étape 1 : alterner rotation lente (SCAN_ROT_FRAMES) et pause
+        # Étape 1 : alterner rotation lente (SCAN_ROT_FRAMES) et pause longue
         #           (SCAN_PAUSE_FRAMES). Détection uniquement pendant la pause.
+        # Étape 2 : si 1 tour complet sans détection, drift latéral (gauche
+        #           LATERAL_OFFSET_M, puis droite LATERAL_OFFSET_M). Le drone
+        #           continue de tourner CCW pendant que la position drift
+        #           doucement vers la cible latérale. Critique pour les gates
+        #           perpendiculaires invisibles depuis la position d'arrivée
+        #           d'une gate précédente.
         # =====================================================================
         if self.state == 'scan_ccw':
-            SCAN_SETTLE_FRAMES = 25    # ~0.5s à 50Hz : anti-inertie scan_clear→scan_ccw
-            SCAN_ROT_FRAMES    = 10    # rotation lente (avant : 3 → trop instable en x1)
-            SCAN_PAUSE_FRAMES  = 15    # pause stable pour détection fiable
-            SCAN_TIMEOUT       = 600
+            SCAN_SETTLE_FRAMES = 25     # ~0.5s à 50Hz : anti-inertie scan_clear→scan_ccw
+            SCAN_ROT_FRAMES    = 6      # rotation très lente — pas plus petits, moins de chances de manquer une gate entre 2 pauses
+            SCAN_PAUSE_FRAMES  = 25     # pause longue — détection fiable des gates lointaines/edge-on
+            LATERAL_OFFSET_M   = 0.40   # m : amplitude du drift latéral (gauche/droite)
+            LATERAL_SPEED      = 0.10   # m/s : drift très doux, yaw continue de tourner pendant
+            FULL_ROTATION_RAD  = 2*np.pi + 0.3   # 1 tour complet + petite marge
 
-            # Phase 0 : stabilisation à l'entrée (rester immobile au yaw courant)
+            # ----- Phase 0 : stabilisation à l'entrée (rester immobile au yaw courant) -----
             if self.scan_just_entered:
+                if self.scan_settle_frames == 0:
+                    # Première frame en scan_ccw : enregistrer position+yaw
+                    # comme référence pour les drifts latéraux ultérieurs.
+                    self.scan_origin_pos     = pos[:2].copy()
+                    self.scan_origin_yaw     = yaw
+                    self.scan_total_rotation = 0.0
+                    self.scan_yaw_prev       = yaw
+                    self.scan_lateral_phase  = 0
                 self.scan_settle_frames += 1
                 if self.scan_settle_frames >= SCAN_SETTLE_FRAMES:
                     self.scan_just_entered = False
@@ -427,6 +467,44 @@ class MyAssignment:
             self.scan_frames       += 1
             self.scan_phase_frames += 1
 
+            # ----- Suivi de la rotation totale CCW depuis le début du tour courant -----
+            delta_yaw = self._angle_diff(yaw, self.scan_yaw_prev)
+            if delta_yaw > 0:   # ne compte que la rotation CCW (positive)
+                self.scan_total_rotation += delta_yaw
+            self.scan_yaw_prev = yaw
+
+            # ----- Si 1 tour complet sans détection : passer à la phase latérale suivante -----
+            if self.scan_total_rotation > FULL_ROTATION_RAD:
+                if self.scan_lateral_phase < 2:
+                    self.scan_lateral_phase += 1
+                    self.scan_total_rotation = 0.0
+                    phase_name = ['centre', 'gauche', 'droite'][self.scan_lateral_phase]
+                    print(f"[SCAN] Tour complet sans détection → drift latéral '{phase_name}'")
+                else:
+                    # Tous les drifts essayés : continuer à tourner sur place
+                    self.scan_total_rotation = 0.0
+
+            # ----- Calcul de la position cible (selon la phase latérale courante) -----
+            # left_dir = perpendiculaire gauche au yaw d'entrée du scan
+            left_dir = np.array([-np.sin(self.scan_origin_yaw),
+                                  np.cos(self.scan_origin_yaw)])
+            if self.scan_lateral_phase == 1:
+                lateral_target = self.scan_origin_pos + LATERAL_OFFSET_M * left_dir
+            elif self.scan_lateral_phase == 2:
+                lateral_target = self.scan_origin_pos - LATERAL_OFFSET_M * left_dir
+            else:
+                lateral_target = self.scan_origin_pos
+
+            # Drift doux vers la cible (sans saut)
+            to_target = lateral_target - pos[:2]
+            dist_to_target = np.linalg.norm(to_target)
+            if dist_to_target > 0.03:
+                step = min(LATERAL_SPEED, dist_to_target)
+                next_xy = pos[:2] + step * to_target / dist_to_target
+            else:
+                next_xy = pos[:2]
+
+            # ----- Bascule rotate/pause -----
             if self.scan_phase == 'rotate' and self.scan_phase_frames >= SCAN_ROT_FRAMES:
                 self.scan_phase        = 'pause'
                 self.scan_phase_frames = 0
@@ -434,6 +512,7 @@ class MyAssignment:
                 self.scan_phase        = 'rotate'
                 self.scan_phase_frames = 0
 
+            # ----- Détection (uniquement pendant la pause stable) -----
             if self.scan_phase == 'pause':
                 detections, self.debug_mask, _ = detect_gates(camera_data)
                 if detections:
@@ -446,18 +525,18 @@ class MyAssignment:
                     self.scan_frames = 0
                     self.scan_phase = 'rotate'
                     self.scan_phase_frames = 0
-                    print(f"[STATE] Gate détecté (pause) aire={det['area']:.0f} "
-                          f"coins={det['corner_count']} → refine")
-                elif self.scan_frames > SCAN_TIMEOUT:
-                    print(f"[STATE] Timeout scan ({self.scan_frames}f) → on continue")
-                    self.scan_frames = 0
+                    print(f"[STATE] Gate détecté (pause, drift_phase={self.scan_lateral_phase}) "
+                          f"aire={det['area']:.0f} coins={det['corner_count']} → refine")
 
+            # ----- Sortie : envoyer le setpoint -----
+            # Position : suit le drift latéral (revient à origin si phase 0).
+            # Yaw     : tourne pendant 'rotate', figé pendant 'pause'.
             if self.state == 'scan_ccw':
                 if self.scan_phase == 'rotate':
                     new_yaw = self._normalize_angle(yaw + YAW_RATE_SCAN * dt)
-                    return [pos[0], pos[1], CRUISE_ALT, new_yaw]
+                    return [float(next_xy[0]), float(next_xy[1]), CRUISE_ALT, new_yaw]
                 else:
-                    return [pos[0], pos[1], CRUISE_ALT, yaw]
+                    return [float(next_xy[0]), float(next_xy[1]), CRUISE_ALT, yaw]
 
         # =====================================================================
         # REFINE
@@ -522,8 +601,9 @@ class MyAssignment:
         # APPROACH : servo visuel + gestion gate perpendiculaire
         #
         # Si la gate visible n'est pas carrée (ratio w/h < SQUARE_THRESH),
-        # on déclenche une manœuvre DÉTERMINISTE de 3s :
-        #   - cible figée : à droite de la gate + un peu en avant
+        # on déclenche une manœuvre DÉTERMINISTE de ~5s :
+        #   - 1ère tentative : à droite de la gate + un peu en arrière
+        #   - 2ème tentative : à gauche de la gate + un peu en arrière
         #   - yaw figé : pointe vers la gate (calculé une seule fois)
         # → pas d'oscillation pendant la manœuvre car aucune valeur n'est
         #   recalculée à partir de l'image instable.
@@ -532,31 +612,38 @@ class MyAssignment:
             detections, self.debug_mask, _ = detect_gates(camera_data)
 
             # ---- Manœuvre perpendiculaire en cours : suivre cible figée ----
-            PERP_DURATION_FRAMES = 150   # ~3s à 50Hz
+            PERP_DURATION_FRAMES = 250   # ~5s à 50Hz (avant 150) — le drift est doux, il faut le temps d'arriver
+            PERP_AREA_OK         = 300   # px² : si aire dépasse → la manœuvre a réussi à révéler la gate
             if self.perp_active:
                 self.perp_frames += 1
 
                 # Vérifier si la gate est maintenant plus visible (aire augmentée)
                 # Si oui → la manœuvre a servi, repasser en approche normale.
-                PERP_AREA_OK = 300   # px² : si aire dépasse ce seuil → assez carré
                 if detections:
                     best = detections[0]
                     if best['area'] > PERP_AREA_OK:
                         self.perp_active = False
-                        self.perp_done   = True
+                        # Marquer cette tentative comme conclusive : on n'en redéclenche pas
+                        self.perp_attempts = 99
                         print(f"[PERP] Gate visible (aire={best['area']:.0f}) "
                               f"→ fin manœuvre, approche normale")
                         # Ne pas return ici → on retombe dans l'approche normale
 
-                # Timeout 3s si la gate ne devient pas plus visible
+                # Timeout : la cible courante n'a pas révélé la gate
                 if self.perp_active and self.perp_frames >= PERP_DURATION_FRAMES:
                     self.perp_active = False
-                    self.perp_done   = True
-                    print("[PERP] Timeout 3s → approche normale")
+                    if self.perp_attempts == 1:
+                        # 1ère tentative (droite) terminée sans succès → on tentera la gauche
+                        # à la prochaine détection de gate perpendiculaire (logique plus bas).
+                        print("[PERP] Tentative droite échouée → retour approche, prêt pour tentative gauche")
+                    else:
+                        # 2ème tentative (gauche) terminée → plus rien à faire, on reste en approche normale
+                        self.perp_attempts = 99
+                        print("[PERP] Les deux côtés essayés → approche normale forcée")
 
                 # Avancer DOUCEMENT vers la cible (pas un saut)
                 if self.perp_active:
-                    PERP_SPEED = 0.15   # m/s — doux, pas de saut
+                    PERP_SPEED = 0.18   # m/s (avant 0.15) — un peu plus rapide pour atteindre la cible dans les 5s
                     dx = self.perp_target[0] - pos[0]
                     dy = self.perp_target[1] - pos[1]
                     dist_to_target = np.linalg.norm([dx, dy])
@@ -567,7 +654,7 @@ class MyAssignment:
                                 float(self.perp_target[2]),
                                 float(self.perp_lock_dir)]
                     else:
-                        # Cible atteinte avant timeout → rester sur place
+                        # Cible atteinte avant timeout → rester sur place et continuer à observer
                         return [float(self.perp_target[0]),
                                 float(self.perp_target[1]),
                                 float(self.perp_target[2]),
@@ -597,12 +684,14 @@ class MyAssignment:
                 else:
                     self.gate_rough_pos = np.array([gate_x, gate_y, gate_z])
 
-                # ---- Test gate perpendiculaire (déclenchement manœuvre 3s) ----
+                # ---- Test gate perpendiculaire (déclenchement manœuvre 5s) ----
                 w, h          = det['w'], det['h']
                 aspect        = min(w, h) / max(w, h, 1)
                 SQUARE_THRESH = 0.6
 
-                if aspect < SQUARE_THRESH and not self.perp_done:
+                # On déclenche tant qu'on n'a pas épuisé les 2 tentatives (perp_attempts < 2).
+                # 0 → on essaie la droite, 1 → on essaie la gauche, 99 → bloqué (déjà géré).
+                if aspect < SQUARE_THRESH and self.perp_attempts < 2:
                     # Verrouiller la cible et la direction (calculées UNE FOIS)
                     g  = self.gate_rough_pos
                     dx = g[0] - pos[0]
@@ -616,20 +705,25 @@ class MyAssignment:
                     fwd   = np.array([np.cos(fdir), np.sin(fdir)])
                     right = np.array([np.sin(fdir), -np.cos(fdir)])
 
-                    # Cible : à droite de la gate + un peu en face de la gate
-                    # (= légèrement en arrière de la gate dans la direction
-                    # drone→gate, pour avoir une vue plus large)
-                    RIGHT_OFFSET = 0.6   # m vers la droite de la gate
-                    FWD_OFFSET   = 0.4   # m en arrière (entre drone et gate)
+                    # Choix du côté selon la tentative :
+                    #   1ère tentative (perp_attempts=0) → droite (+RIGHT_OFFSET)
+                    #   2ème tentative (perp_attempts=1) → gauche (-RIGHT_OFFSET)
+                    LATERAL_OFFSET_PERP = 0.5    # m — atteignable dans 5s
+                    BACK_OFFSET_PERP    = 0.3    # m — recul modeste pour avoir une vue plus large
+                    side_sign = 1.0 if self.perp_attempts == 0 else -1.0
+                    side_name = "droite" if self.perp_attempts == 0 else "gauche"
+
                     target_xy = np.array([g[0], g[1]]) \
-                              + RIGHT_OFFSET * right \
-                              - FWD_OFFSET   * fwd
+                              + side_sign * LATERAL_OFFSET_PERP * right \
+                              - BACK_OFFSET_PERP * fwd
                     self.perp_target = np.array([target_xy[0], target_xy[1],
                                                   float(g[2])])
-                    self.perp_active = True
-                    self.perp_frames = 1
+                    self.perp_active   = True
+                    self.perp_frames   = 1
+                    self.perp_attempts += 1
                     print(f"[PERP] Gate perpendiculaire (aspect={aspect:.2f}) "
-                          f"→ manœuvre 3s : cible={np.round(self.perp_target,2)}, "
+                          f"→ tentative {self.perp_attempts}/2 ({side_name}) : "
+                          f"cible={np.round(self.perp_target,2)}, "
                           f"yaw_lock={np.degrees(self.perp_lock_dir):.1f}°")
                     return [float(self.perp_target[0]),
                             float(self.perp_target[1]),
